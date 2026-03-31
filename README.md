@@ -1,5 +1,8 @@
 # pi-multi-auth
 
+<img width="1024" height="506" alt="image" src="https://github.com/user-attachments/assets/1aff63b4-0e1e-4eaa-93b4-5f4f9188224b" />
+
+
 `pi-multi-auth` is a Pi extension for multi-provider credential management, OAuth login, and quota-aware account rotation.
 
 ## Repository structure
