@@ -1,0 +1,69 @@
+{
+  "name": "pi-multi-auth",
+  "version": "0.1.0",
+  "description": "Pi extension for multi-provider credential management, OAuth login, and account rotation.",
+  "type": "module",
+  "main": "./index.ts",
+  "exports": {
+    ".": "./index.ts",
+    "./balancer": "./src/balancer/index.ts",
+    "./balancer/index.js": "./src/balancer/index.ts",
+    "./balancer/credential-backoff": "./src/balancer/credential-backoff.ts",
+    "./balancer/credential-backoff.js": "./src/balancer/credential-backoff.ts"
+  },
+  "files": [
+    "index.ts",
+    "src",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "npm run typecheck",
+    "typecheck": "tsc -p tsconfig.json",
+    "lint": "npm run typecheck",
+    "test:clean": "node -e \"require('node:fs').rmSync('.test-dist', { recursive: true, force: true })\"",
+    "pretest": "npm run test:clean",
+    "test": "tsc -p tsconfig.test.json && node --test .test-dist/tests/responsive-modal.test.js .test-dist/tests/index-startup.test.js .test-dist/tests/runtime-paths.test.js .test-dist/tests/credential-entitlement.test.js .test-dist/tests/smart-add-provider.test.js .test-dist/tests/oauth-login-flow.test.js .test-dist/tests/core-enhancements.test.js",
+    "posttest": "npm run test:clean",
+    "check": "npm run typecheck && npm run test"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "multi-auth",
+    "oauth",
+    "credentials",
+    "rotation"
+  ],
+  "author": "MasuRii",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "dependencies": {
+    "proper-lockfile": "^4.1.2"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-ai": "^0.64.0",
+    "@mariozechner/pi-coding-agent": "^0.64.0",
+    "@mariozechner/pi-tui": "^0.64.0"
+  },
+  "devDependencies": {
+    "@mariozechner/pi-ai": "^0.64.0",
+    "@mariozechner/pi-coding-agent": "^0.64.0",
+    "@mariozechner/pi-tui": "^0.64.0",
+    "@types/node": "^25.5.0",
+    "@types/proper-lockfile": "^4.1.4",
+    "typescript": "^6.0.2"
+  }
+}
