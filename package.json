@@ -1,6 +1,6 @@
 {
   "name": "pi-multi-auth",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Pi extension for multi-provider credential management, OAuth login, and account rotation.",
   "type": "module",
   "main": "./index.ts",
