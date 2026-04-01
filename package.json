@@ -32,10 +32,16 @@
     "pi-package",
     "pi",
     "pi-extension",
+    "pi-coding-agent",
+    "coding-agent",
     "multi-auth",
+    "multi-provider",
     "oauth",
+    "authentication",
     "credentials",
-    "rotation"
+    "credential-management",
+    "rotation",
+    "account-rotation"
   ],
   "author": "MasuRii",
   "license": "MIT",
