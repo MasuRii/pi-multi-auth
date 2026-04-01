@@ -65,6 +65,10 @@ function clearTimer(timer: ReturnType<typeof setTimeout> | null): void {
 	}
 }
 
+function getAbortSignalTimeoutError(signal: AbortSignal): StreamAttemptTimeoutError | null {
+	return signal.reason instanceof StreamAttemptTimeoutError ? signal.reason : null;
+}
+
 export function isAbortError(error: unknown): boolean {
 	if (error instanceof Error) {
 		return error.name === "AbortError" || ABORT_MESSAGE_PATTERN.test(error.message);
@@ -87,8 +91,12 @@ export function createStreamAttemptWatchdog(options: {
 	let idleTimer: ReturnType<typeof setTimeout> | null = null;
 	let timeoutError: StreamAttemptTimeoutError | null = null;
 
+	const getResolvedTimeoutError = (): StreamAttemptTimeoutError | null => {
+		return timeoutError ?? getAbortSignalTimeoutError(controller.signal);
+	};
+
 	const abortForTimeout = (timeoutKind: StreamAttemptTimeoutKind, timeoutMs: number): void => {
-		if (timeoutError || controller.signal.aborted) {
+		if (getResolvedTimeoutError() || controller.signal.aborted) {
 			return;
 		}
 
@@ -106,7 +114,7 @@ export function createStreamAttemptWatchdog(options: {
 			timeoutKind,
 			timeoutMs,
 		});
-		controller.abort();
+		controller.abort(timeoutError);
 	};
 
 	const resetIdleTimer = (): void => {
@@ -144,10 +152,10 @@ export function createStreamAttemptWatchdog(options: {
 			resetIdleTimer();
 		},
 		getTimeoutError(): StreamAttemptTimeoutError | null {
-			return timeoutError;
+			return getResolvedTimeoutError();
 		},
 		isCallerAbort(error?: unknown): boolean {
-			if (!options.parentSignal?.aborted || timeoutError) {
+			if (!options.parentSignal?.aborted || getResolvedTimeoutError()) {
 				return false;
 			}
 			if (error === undefined) {
@@ -156,7 +164,11 @@ export function createStreamAttemptWatchdog(options: {
 			return isAbortError(error);
 		},
 		isCallerAbortMessage(message: string): boolean {
-			return Boolean(options.parentSignal?.aborted) && timeoutError === null && isAbortError(message);
+			return (
+				Boolean(options.parentSignal?.aborted) &&
+				getResolvedTimeoutError() === null &&
+				isAbortError(message)
+			);
 		},
 		dispose(): void {
 			clearTimer(attemptTimer);
