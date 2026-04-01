@@ -1,9 +1,13 @@
 # pi-multi-auth
 
+[![npm version](https://img.shields.io/npm/v/pi-multi-auth.svg)](https://www.npmjs.com/package/pi-multi-auth) [![GitHub](https://img.shields.io/badge/GitHub-MasuRii%2Fpi--multi--auth-blue)](https://github.com/MasuRii/pi-multi-auth)
+
 <img width="1024" height="506" alt="image" src="https://github.com/user-attachments/assets/1aff63b4-0e1e-4eaa-93b4-5f4f9188224b" />
 
-
 `pi-multi-auth` is a Pi extension for multi-provider credential management, OAuth login, and quota-aware account rotation.
+
+- **npm**: https://www.npmjs.com/package/pi-multi-auth
+- **GitHub**: https://github.com/MasuRii/pi-multi-auth
 
 ## Repository structure
 

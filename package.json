@@ -39,6 +39,14 @@
   ],
   "author": "MasuRii",
   "license": "MIT",
+  "homepage": "https://github.com/MasuRii/pi-multi-auth#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MasuRii/pi-multi-auth.git"
+  },
+  "bugs": {
+    "url": "https://github.com/MasuRii/pi-multi-auth/issues"
+  },
   "engines": {
     "node": ">=20"
   },
