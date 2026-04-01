@@ -29,6 +29,7 @@ import { OAuthRefreshScheduler, determineTokenExpiration, extractJwtExpiration }
 import { PoolManager } from "../src/pool-manager.js";
 import { createRotatingStreamWrapper } from "../src/provider.js";
 import { ProviderRegistry } from "../src/provider-registry.js";
+import { StreamAttemptTimeoutError } from "../src/stream-watchdog.js";
 import { RateLimitHeaderParser } from "../src/rate-limit-headers.js";
 import { createDefaultMultiAuthState, getProviderState, MultiAuthStorage } from "../src/storage.js";
 import { OAuthRefreshFailureError } from "../src/types-oauth.js";
@@ -395,7 +396,9 @@ function createAbortAwareTimeoutProvider(
 	options: {
 		behaviorByApiKey: Record<string, "hang_silently" | "start_then_hang" | "success">;
 		successText: string;
+		abortMessage?: string;
 		onCall?: (apiKey: string) => void;
+		onAbort?: (apiKey: string, reason: unknown) => void;
 	},
 ): {
 	streamSimple: (
@@ -419,12 +422,13 @@ function createAbortAwareTimeoutProvider(
 			const stream = createAssistantMessageEventStream();
 			const emitAbortError = () => {
 				queueMicrotask(() => {
+					options.onAbort?.(apiKey, streamOptions?.signal?.reason);
 					stream.push({
 						type: "error",
 						reason: "error",
 						error: createAssistantMessageForTest(model, [], {
 							stopReason: "error",
-							errorMessage: "Provider request was aborted.",
+							errorMessage: options.abortMessage ?? "Provider request was aborted.",
 						}),
 					});
 					stream.end();
@@ -633,6 +637,123 @@ test("rotating stream wrapper aborts started streams after the hard attempt time
 		},
 	]);
 	assert.equal(events.some((event) => event.type === "error"), false);
+});
+
+test("rotating stream wrapper preserves watchdog timeout identity across generic abort surfaces", async () => {
+	const model = createTestModel("openai");
+	const observedAbortReasons: unknown[] = [];
+	const transientCooldowns: Array<{ credentialId: string; message: string }> = [];
+	const wrapper = createRotatingStreamWrapper(
+		"openai",
+		createRotatingTimeoutAccountManagerStub({
+			provider: "openai",
+			credentials: [
+				{ credentialId: "credential-a", secret: "secret-a" },
+				{ credentialId: "credential-b", secret: "secret-b" },
+			],
+			onTransientCooldown: (credentialId, message) => {
+				transientCooldowns.push({ credentialId, message });
+			},
+		}),
+		createAbortAwareTimeoutProvider(model, {
+			behaviorByApiKey: {
+				"secret-a": "hang_silently",
+				"secret-b": "success",
+			},
+			abortMessage: "Operation aborted",
+			successText: "Recovered after generic abort timeout.",
+			onAbort: (_apiKey, reason) => {
+				observedAbortReasons.push(reason);
+			},
+		}) as never,
+		new Map(),
+		{
+			attemptTimeoutMs: 200,
+			idleTimeoutMs: 20,
+		},
+	);
+
+	const events = await collectAssistantEvents(wrapper(model, createTestContext(), { apiKey: "secret" }));
+	const doneEvent = events.find(
+		(event): event is Extract<AssistantMessageEvent, { type: "done" }> => event.type === "done",
+	);
+	assert.ok(doneEvent);
+	assert.equal(
+		(doneEvent.message.content.find((block) => block.type === "text") as { text: string }).text,
+		"Recovered after generic abort timeout.",
+	);
+	assert.equal(observedAbortReasons.length, 3);
+	for (const reason of observedAbortReasons) {
+		if (!(reason instanceof StreamAttemptTimeoutError)) {
+			assert.fail(`Expected StreamAttemptTimeoutError, received ${String(reason)}`);
+		}
+		assert.equal(reason.timeoutKind, "idle_timeout");
+		assert.equal(
+			reason.message,
+			"multi-auth stream timeout (idle_timeout): provider=openai: credential=credential-a: model=glm-5: stalled for 20ms without receiving any stream event",
+		);
+	}
+	assert.deepEqual(transientCooldowns, [
+		{
+			credentialId: "credential-a",
+			message:
+				"multi-auth stream timeout (idle_timeout): provider=openai: credential=credential-a: model=glm-5: stalled for 20ms without receiving any stream event",
+		},
+	]);
+	assert.equal(events.some((event) => event.type === "error"), false);
+});
+
+test("rotating stream wrapper keeps caller initiated aborts terminal", async () => {
+	const model = createTestModel("openai");
+	const acquiredCredentialIds: string[] = [];
+	const transientCooldowns: Array<{ credentialId: string; message: string }> = [];
+	const callsByApiKey = new Map<string, number>();
+	const abortController = new AbortController();
+	abortController.abort();
+	const wrapper = createRotatingStreamWrapper(
+		"openai",
+		createRotatingTimeoutAccountManagerStub({
+			provider: "openai",
+			credentials: [
+				{ credentialId: "credential-a", secret: "secret-a" },
+				{ credentialId: "credential-b", secret: "secret-b" },
+			],
+			onAcquire: (credentialId) => {
+				acquiredCredentialIds.push(credentialId);
+			},
+			onTransientCooldown: (credentialId, message) => {
+				transientCooldowns.push({ credentialId, message });
+			},
+		}),
+		createAbortAwareTimeoutProvider(model, {
+			behaviorByApiKey: {
+				"secret-a": "hang_silently",
+				"secret-b": "success",
+			},
+			abortMessage: "Operation aborted",
+			successText: "This should never be emitted.",
+			onCall: (apiKey) => {
+				callsByApiKey.set(apiKey, (callsByApiKey.get(apiKey) ?? 0) + 1);
+			},
+		}) as never,
+		new Map(),
+		{
+			attemptTimeoutMs: 200,
+			idleTimeoutMs: 20,
+		},
+	);
+
+	const events = await collectAssistantEvents(
+		wrapper(model, createTestContext(), {
+			apiKey: "secret",
+			signal: abortController.signal,
+		}),
+	);
+	assert.deepEqual(events, []);
+	assert.deepEqual(acquiredCredentialIds, ["credential-a"]);
+	assert.equal(callsByApiKey.get("secret-a"), 1);
+	assert.equal(callsByApiKey.get("secret-b"), undefined);
+	assert.deepEqual(transientCooldowns, []);
 });
 
 test("rate-limit header parser normalizes reset headers and retry metadata", () => {
