@@ -22,7 +22,10 @@ import {
 } from "./error-classifier.js";
 import { multiAuthDebugLogger } from "./debug-logger.js";
 import { ProviderRegistry } from "./provider-registry.js";
-import { createStreamAttemptWatchdog } from "./stream-watchdog.js";
+import {
+	createStreamAttemptWatchdog,
+	type StreamAttemptWatchdog,
+} from "./stream-watchdog.js";
 import {
 	DEFAULT_STREAM_TIMEOUT_CONFIG,
 	type StreamTimeoutConfig,
@@ -80,6 +83,20 @@ function getAssistantErrorMessage(error: AssistantMessage): string {
 		return error.errorMessage;
 	}
 	return getErrorMessage(error);
+}
+
+function resolveAttemptFailureError(
+	watchdog: StreamAttemptWatchdog,
+	failure: unknown,
+): unknown {
+	return watchdog.getTimeoutError() ?? failure;
+}
+
+function resolveAttemptFailureMessage(
+	watchdog: StreamAttemptWatchdog,
+	failure: unknown,
+): string {
+	return getErrorMessage(resolveAttemptFailureError(watchdog, failure));
 }
 
 function getOrCreateProviderRegistrationMetricState(
@@ -673,7 +690,7 @@ export function createRotatingStreamWrapper(
 							stream.end();
 							return;
 						}
-						const retryError = watchdog.getTimeoutError() ?? error;
+						const retryError = resolveAttemptFailureError(watchdog, error);
 						const message = getErrorMessage(retryError);
 						const decision = await resolveRetryDecision(
 							message,
@@ -711,9 +728,10 @@ export function createRotatingStreamWrapper(
 										stream.end();
 										return;
 									}
-									const message =
-										watchdog.getTimeoutError()?.message ??
-										getAssistantErrorMessage(event.error);
+									const message = resolveAttemptFailureMessage(
+										watchdog,
+										getAssistantErrorMessage(event.error),
+									);
 									const decision = await resolveRetryDecision(
 										message,
 										hasForwardedSubstantiveEvent,
@@ -757,7 +775,7 @@ export function createRotatingStreamWrapper(
 							stream.end();
 							return;
 						}
-						const retryError = watchdog.getTimeoutError() ?? error;
+						const retryError = resolveAttemptFailureError(watchdog, error);
 						const message = getErrorMessage(retryError);
 						const decision = await resolveRetryDecision(
 							message,
@@ -788,11 +806,12 @@ export function createRotatingStreamWrapper(
 							stream.end();
 							return;
 						}
-						const message =
-							watchdog.getTimeoutError()?.message ??
-							(!forwardedAnyEvent
+						const message = resolveAttemptFailureMessage(
+							watchdog,
+							!forwardedAnyEvent
 								? `Provider stream ended before completion event for ${activeProviderId} (credential ${selected.credentialId}) without emitting any events.`
-								: `Provider stream ended before completion event for ${activeProviderId} (credential ${selected.credentialId}).`);
+								: `Provider stream ended before completion event for ${activeProviderId} (credential ${selected.credentialId}).`,
+						);
 						const decision = await resolveRetryDecision(
 							message,
 							hasForwardedSubstantiveEvent,
