@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -15,6 +15,13 @@ import {
 	type SimpleStreamOptions,
 } from "@mariozechner/pi-ai";
 import { AccountManager } from "../src/account-manager.js";
+import {
+	formatOAuthRefreshFailureSummary,
+	getErrorMessage,
+	inferOAuthRefreshFailureMetadata,
+	isRecord,
+} from "../src/auth-error-utils.js";
+import { AsyncBufferedLogWriter } from "../src/async-buffered-log-writer.js";
 import { AuthWriter } from "../src/auth-writer.js";
 import {
 	DEFAULT_MULTI_AUTH_CONFIG,
@@ -25,11 +32,18 @@ import { multiAuthDebugLogger } from "../src/debug-logger.js";
 import { classifyCredentialError } from "../src/error-classifier.js";
 import { isRetryableFileAccessError, writeTextSnapshotWithRetries } from "../src/file-retry.js";
 import { HealthScorer } from "../src/health-scorer.js";
+import { refreshOAuthCredential, registerOAuthProvider, resetOAuthProviders } from "../src/oauth-compat.js";
+import { registerClineOAuthProvider } from "../src/oauth-cline.js";
 import { OAuthRefreshScheduler, determineTokenExpiration, extractJwtExpiration } from "../src/oauth-refresh-scheduler.js";
+import {
+	PI_AGENT_ROUTER_DELEGATED_API_KEY_ENV,
+	PI_AGENT_ROUTER_DELEGATED_CREDENTIAL_ID_ENV,
+	PI_AGENT_ROUTER_DELEGATED_PROVIDER_ID_ENV,
+	PI_AGENT_ROUTER_SUBAGENT_ENV,
+} from "../src/runtime-context.js";
 import { PoolManager } from "../src/pool-manager.js";
 import { createRotatingStreamWrapper } from "../src/provider.js";
 import { ProviderRegistry } from "../src/provider-registry.js";
-import { StreamAttemptTimeoutError } from "../src/stream-watchdog.js";
 import { RateLimitHeaderParser } from "../src/rate-limit-headers.js";
 import { createDefaultMultiAuthState, getProviderState, MultiAuthStorage } from "../src/storage.js";
 import { OAuthRefreshFailureError } from "../src/types-oauth.js";
@@ -109,8 +123,10 @@ function cloneExtensionConfig(): MultiAuthExtensionConfig {
 			weights: { ...DEFAULT_MULTI_AUTH_CONFIG.health.weights },
 		},
 		historyPersistence: { ...DEFAULT_MULTI_AUTH_CONFIG.historyPersistence },
-		oauthRefresh: { ...DEFAULT_MULTI_AUTH_CONFIG.oauthRefresh },
-		streamTimeouts: { ...DEFAULT_MULTI_AUTH_CONFIG.streamTimeouts },
+		oauthRefresh: {
+			...DEFAULT_MULTI_AUTH_CONFIG.oauthRefresh,
+			excludedProviders: [...DEFAULT_MULTI_AUTH_CONFIG.oauthRefresh.excludedProviders],
+		},
 	};
 }
 
@@ -310,6 +326,66 @@ function createStreamingBaseProvider(
 					partial: partialText,
 				});
 				stream.push({ type: "done", reason: "stop", message: finalMessage });
+				stream.end();
+			});
+			return stream;
+		},
+	};
+}
+
+function createEmptyCompletionThenSuccessProvider(
+	model: Model<"openai-completions">,
+	options: {
+		text: string;
+		onCall?: (callNumber: number) => void;
+	},
+): {
+	streamSimple: () => ReturnType<typeof createAssistantMessageEventStream>;
+} {
+	let callCount = 0;
+
+	return {
+		streamSimple: () => {
+			const stream = createAssistantMessageEventStream();
+			const currentCall = callCount;
+			callCount += 1;
+			options.onCall?.(callCount);
+			queueMicrotask(() => {
+				stream.push({ type: "start", partial: createAssistantMessageForTest(model, []) });
+				if (currentCall === 0) {
+					stream.push({
+						type: "done",
+						reason: "stop",
+						message: createAssistantMessageForTest(model, [], {
+							usage: {
+								...createAssistantUsage(),
+								output: 0,
+								totalTokens: 1,
+							},
+							responseId: "empty-completion-response",
+						}),
+					});
+					stream.end();
+					return;
+				}
+
+				const partialText = createAssistantMessageForTest(model, [
+					{ type: "text", text: options.text },
+				]);
+				stream.push({ type: "text_start", contentIndex: 0, partial: partialText });
+				stream.push({
+					type: "text_delta",
+					contentIndex: 0,
+					delta: options.text,
+					partial: partialText,
+				});
+				stream.push({
+					type: "text_end",
+					contentIndex: 0,
+					content: options.text,
+					partial: partialText,
+				});
+				stream.push({ type: "done", reason: "stop", message: partialText });
 				stream.end();
 			});
 			return stream;
@@ -521,185 +597,202 @@ test("rotating stream wrapper preserves readable ollama thinking blocks", async 
 	assert.deepEqual(doneEvent.message.content.map((block) => block.type), ["thinking", "text"]);
 });
 
-test("rotating stream wrapper aborts silent attempts after idle timeout and rotates credentials", async () => {
-	const model = createTestModel("openai");
-	const acquiredCredentialIds: string[] = [];
-	const succeededCredentialIds: string[] = [];
-	const transientCooldowns: Array<{ credentialId: string; message: string }> = [];
-	const callsByApiKey = new Map<string, number>();
-	const wrapper = createRotatingStreamWrapper(
-		"openai",
-		createRotatingTimeoutAccountManagerStub({
-			provider: "openai",
-			credentials: [
-				{ credentialId: "credential-a", secret: "secret-a" },
-				{ credentialId: "credential-b", secret: "secret-b" },
-			],
-			onAcquire: (credentialId) => {
-				acquiredCredentialIds.push(credentialId);
-			},
-			onSuccess: (credentialId) => {
-				succeededCredentialIds.push(credentialId);
-			},
-			onTransientCooldown: (credentialId, message) => {
-				transientCooldowns.push({ credentialId, message });
-			},
-		}),
-		createAbortAwareTimeoutProvider(model, {
-			behaviorByApiKey: {
-				"secret-a": "hang_silently",
-				"secret-b": "success",
-			},
-			successText: "Recovered after idle timeout.",
-			onCall: (apiKey) => {
-				callsByApiKey.set(apiKey, (callsByApiKey.get(apiKey) ?? 0) + 1);
-			},
-		}) as never,
-		new Map(),
-		{
-			attemptTimeoutMs: 200,
-			idleTimeoutMs: 20,
-		},
-	);
-
-	const events = await collectAssistantEvents(wrapper(model, createTestContext(), { apiKey: "secret" }));
-	const doneEvent = events.find(
-		(event): event is Extract<AssistantMessageEvent, { type: "done" }> => event.type === "done",
-	);
-	assert.ok(doneEvent);
-	assert.equal(
-		(doneEvent.message.content.find((block) => block.type === "text") as { text: string }).text,
-		"Recovered after idle timeout.",
-	);
-	assert.deepEqual(succeededCredentialIds, ["credential-b"]);
-	assert.equal(callsByApiKey.get("secret-a"), 3);
-	assert.equal(callsByApiKey.get("secret-b"), 1);
-	assert.deepEqual(acquiredCredentialIds, ["credential-a", "credential-b"]);
-	assert.deepEqual(transientCooldowns, [
-		{
-			credentialId: "credential-a",
-			message:
-				"multi-auth stream timeout (idle_timeout): provider=openai: credential=credential-a: model=glm-5: stalled for 20ms without receiving any stream event",
-		},
-	]);
-	assert.equal(events.some((event) => event.type === "error"), false);
-});
-
-test("rotating stream wrapper aborts started streams after the hard attempt timeout", async () => {
-	const model = createTestModel("openai");
-	const transientCooldowns: Array<{ credentialId: string; message: string }> = [];
-	const callsByApiKey = new Map<string, number>();
-	const wrapper = createRotatingStreamWrapper(
-		"openai",
-		createRotatingTimeoutAccountManagerStub({
-			provider: "openai",
-			credentials: [
-				{ credentialId: "credential-a", secret: "secret-a" },
-				{ credentialId: "credential-b", secret: "secret-b" },
-			],
-			onTransientCooldown: (credentialId, message) => {
-				transientCooldowns.push({ credentialId, message });
-			},
-		}),
-		createAbortAwareTimeoutProvider(model, {
-			behaviorByApiKey: {
-				"secret-a": "start_then_hang",
-				"secret-b": "success",
-			},
-			successText: "Recovered after hard timeout.",
-			onCall: (apiKey) => {
-				callsByApiKey.set(apiKey, (callsByApiKey.get(apiKey) ?? 0) + 1);
-			},
-		}) as never,
-		new Map(),
-		{
-			attemptTimeoutMs: 40,
-			idleTimeoutMs: 200,
-		},
-	);
-
-	const events = await collectAssistantEvents(wrapper(model, createTestContext(), { apiKey: "secret" }));
-	const doneEvent = events.find(
-		(event): event is Extract<AssistantMessageEvent, { type: "done" }> => event.type === "done",
-	);
-	assert.ok(doneEvent);
-	assert.equal(
-		(doneEvent.message.content.find((block) => block.type === "text") as { text: string }).text,
-		"Recovered after hard timeout.",
-	);
-	assert.equal(callsByApiKey.get("secret-a"), 3);
-	assert.equal(callsByApiKey.get("secret-b"), 1);
-	assert.deepEqual(transientCooldowns, [
-		{
-			credentialId: "credential-a",
-			message:
-				"multi-auth stream timeout (attempt_timeout): provider=openai: credential=credential-a: model=glm-5: exceeded the per-attempt deadline of 40ms without completion",
-		},
-	]);
-	assert.equal(events.some((event) => event.type === "error"), false);
-});
-
-test("rotating stream wrapper preserves watchdog timeout identity across generic abort surfaces", async () => {
-	const model = createTestModel("openai");
-	const observedAbortReasons: unknown[] = [];
-	const transientCooldowns: Array<{ credentialId: string; message: string }> = [];
-	const wrapper = createRotatingStreamWrapper(
-		"openai",
-		createRotatingTimeoutAccountManagerStub({
-			provider: "openai",
-			credentials: [
-				{ credentialId: "credential-a", secret: "secret-a" },
-				{ credentialId: "credential-b", secret: "secret-b" },
-			],
-			onTransientCooldown: (credentialId, message) => {
-				transientCooldowns.push({ credentialId, message });
-			},
-		}),
-		createAbortAwareTimeoutProvider(model, {
-			behaviorByApiKey: {
-				"secret-a": "hang_silently",
-				"secret-b": "success",
-			},
-			abortMessage: "Operation aborted",
-			successText: "Recovered after generic abort timeout.",
-			onAbort: (_apiKey, reason) => {
-				observedAbortReasons.push(reason);
-			},
-		}) as never,
-		new Map(),
-		{
-			attemptTimeoutMs: 200,
-			idleTimeoutMs: 20,
-		},
-	);
-
-	const events = await collectAssistantEvents(wrapper(model, createTestContext(), { apiKey: "secret" }));
-	const doneEvent = events.find(
-		(event): event is Extract<AssistantMessageEvent, { type: "done" }> => event.type === "done",
-	);
-	assert.ok(doneEvent);
-	assert.equal(
-		(doneEvent.message.content.find((block) => block.type === "text") as { text: string }).text,
-		"Recovered after generic abort timeout.",
-	);
-	assert.equal(observedAbortReasons.length, 3);
-	for (const reason of observedAbortReasons) {
-		if (!(reason instanceof StreamAttemptTimeoutError)) {
-			assert.fail(`Expected StreamAttemptTimeoutError, received ${String(reason)}`);
-		}
-		assert.equal(reason.timeoutKind, "idle_timeout");
-		assert.equal(
-			reason.message,
-			"multi-auth stream timeout (idle_timeout): provider=openai: credential=credential-a: model=glm-5: stalled for 20ms without receiving any stream event",
+for (const providerId of ["ollama", "vivgrid"] as const) {
+	test(`rotating stream wrapper retries empty ${providerId} stop completions before succeeding`, async () => {
+		const model = createTestModel(providerId);
+		let successCount = 0;
+		let providerCallCount = 0;
+		const wrapper = createRotatingStreamWrapper(
+			providerId,
+			createAccountManagerStreamStub({
+				provider: providerId,
+				onSuccess: () => {
+					successCount += 1;
+				},
+			}),
+			createEmptyCompletionThenSuccessProvider(model, {
+				text: "Recovered output.",
+				onCall: () => {
+					providerCallCount += 1;
+				},
+			}) as never,
 		);
-	}
-	assert.deepEqual(transientCooldowns, [
+
+		const events = await collectAssistantEvents(
+			wrapper(model, createTestContext(), { apiKey: "secret" }),
+		);
+		const doneEvents = events.filter(
+			(event): event is Extract<AssistantMessageEvent, { type: "done" }> => event.type === "done",
+		);
+
+		assert.equal(providerCallCount, 2);
+		assert.equal(successCount, 1);
+		assert.equal(doneEvents.length, 1);
+		assert.deepEqual(doneEvents[0].message.content.map((block) => block.type), ["text"]);
+		assert.equal((doneEvents[0].message.content[0] as { text: string }).text, "Recovered output.");
+		assert.equal(
+			events.some((event) => event.type === "done" && event.message.content.length === 0),
+			false,
+		);
+		assert.equal(events.some((event) => event.type === "error"), false);
+	});
+}
+
+test("provider registry restores Cline OAuth capability after OAuth registry resets", () => {
+	resetOAuthProviders();
+	const registry = new ProviderRegistry();
+
+	assert.equal(registry.getProviderCapabilities("cline").supportsOAuth, true);
+	assert.ok(registry.listAvailableOAuthProviders().some((provider) => provider.provider === "cline"));
+
+	resetOAuthProviders();
+});
+
+test("Cline stream wrapper attaches Cline client headers to model requests", async () => {
+	const model = createTestModel("cline");
+	const observedHeaders: Record<string, string | undefined> = {};
+	const wrapper = createRotatingStreamWrapper(
+		"cline",
 		{
-			credentialId: "credential-a",
-			message:
-				"multi-auth stream timeout (idle_timeout): provider=openai: credential=credential-a: model=glm-5: stalled for 20ms without receiving any stream event",
-		},
-	]);
+			acquireCredential: async () => ({
+				provider: "cline",
+				credentialId: "cline",
+				credential: { type: "oauth", access: "token", refresh: "refresh", expires: Date.now() + 3_600_000 },
+				secret: "workos:token",
+				index: 0,
+			}),
+			recordCredentialSuccess: async () => undefined,
+			resolveFailoverTarget: async () => null,
+			disableApiKeyCredential: async () => undefined,
+			markTransientProviderError: async () => 0,
+			markQuotaExceeded: async () => undefined,
+		} as unknown as AccountManager,
+		{
+			streamSimple: (
+				_model: Model<"openai-completions">,
+				_context: Context,
+				options?: SimpleStreamOptions,
+			) => {
+				const headers = options?.headers as Record<string, string> | undefined;
+				observedHeaders["User-Agent"] = headers?.["User-Agent"];
+				observedHeaders["X-CLIENT-TYPE"] = headers?.["X-CLIENT-TYPE"];
+				observedHeaders["X-TASK-ID"] = headers?.["X-TASK-ID"];
+				return createStreamingBaseProvider(model, { thinking: "headers", text: "ok" }).streamSimple();
+			},
+		} as never,
+	);
+
+	const events = await collectAssistantEvents(wrapper(model, createTestContext(), { apiKey: "unused" }));
+
+	assert.equal(events.some((event) => event.type === "done"), true);
+	assert.match(observedHeaders["User-Agent"] ?? "", /^Cline\//);
+	assert.equal(observedHeaders["X-CLIENT-TYPE"], "VSCode Extension");
+	assert.ok(observedHeaders["X-TASK-ID"] && observedHeaders["X-TASK-ID"].length > 0);
+});
+
+test("delegated credential overrides pin the delegated credential through account-manager selection", async (t) => {
+	const model = createTestModel("cline");
+	const delegatedCredentialId = "cline";
+	const acquiredCredentialSelections: string[][] = [];
+	const originalEnv = {
+		[PI_AGENT_ROUTER_SUBAGENT_ENV]: process.env[PI_AGENT_ROUTER_SUBAGENT_ENV],
+		[PI_AGENT_ROUTER_DELEGATED_PROVIDER_ID_ENV]: process.env[PI_AGENT_ROUTER_DELEGATED_PROVIDER_ID_ENV],
+		[PI_AGENT_ROUTER_DELEGATED_CREDENTIAL_ID_ENV]: process.env[PI_AGENT_ROUTER_DELEGATED_CREDENTIAL_ID_ENV],
+		[PI_AGENT_ROUTER_DELEGATED_API_KEY_ENV]: process.env[PI_AGENT_ROUTER_DELEGATED_API_KEY_ENV],
+	};
+
+	t.after(() => {
+		for (const [key, value] of Object.entries(originalEnv)) {
+			if (typeof value === "string") {
+				process.env[key] = value;
+			} else {
+				delete process.env[key];
+			}
+		}
+	});
+
+	process.env[PI_AGENT_ROUTER_SUBAGENT_ENV] = "1";
+	process.env[PI_AGENT_ROUTER_DELEGATED_PROVIDER_ID_ENV] = "cline";
+	process.env[PI_AGENT_ROUTER_DELEGATED_CREDENTIAL_ID_ENV] = delegatedCredentialId;
+	process.env[PI_AGENT_ROUTER_DELEGATED_API_KEY_ENV] = "workos:stale-token";
+
+	const wrapper = createRotatingStreamWrapper(
+		"cline",
+		{
+			listProviderCredentialIds: async () => [delegatedCredentialId, "cline-1"],
+			acquireCredential: async (
+				_provider: string,
+				requestOptions?: { excludedCredentialIds?: Set<string> },
+			) => {
+				const excludedCredentialIds = [...(requestOptions?.excludedCredentialIds ?? new Set<string>())].sort();
+				acquiredCredentialSelections.push(excludedCredentialIds);
+				assert.deepEqual(excludedCredentialIds, ["cline-1"]);
+				return {
+					provider: "cline",
+					credentialId: delegatedCredentialId,
+					credential: {
+						type: "oauth",
+						access: "fresh-token",
+						refresh: "refresh-token",
+						expires: Date.now() + 3_600_000,
+						provider: "cline",
+					},
+					secret: "workos:fresh-token",
+					index: 0,
+				};
+			},
+			recordCredentialSuccess: async () => undefined,
+			resolveFailoverTarget: async () => null,
+			disableApiKeyCredential: async () => undefined,
+			markTransientProviderError: async () => 0,
+			markQuotaExceeded: async () => undefined,
+		} as unknown as AccountManager,
+		{
+			streamSimple: (
+				_model: Model<"openai-completions">,
+				_context: Context,
+				options?: SimpleStreamOptions,
+			) => {
+				const apiKey = typeof options?.apiKey === "string" ? options.apiKey : "";
+				if (apiKey === "workos:fresh-token") {
+					return createStreamingBaseProvider(model, {
+						thinking: "Pinned delegated credential.",
+						text: "Delegated credential pinned successfully.",
+					}).streamSimple();
+				}
+
+				const stream = createAssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({
+						type: "error",
+						reason: "error",
+						error: createAssistantMessageForTest(model, [], {
+							stopReason: "error",
+							errorMessage:
+								'401 "Unauthorized: Please make sure you\'re using the latest version of Cline and re-authenticate your Cline account."',
+						}),
+					});
+					stream.end();
+				});
+				return stream;
+			},
+		} as never,
+	);
+
+	const events = await collectAssistantEvents(
+		wrapper(model, createTestContext(), { apiKey: "unused" }),
+	);
+	const doneEvent = events.find(
+		(event): event is Extract<AssistantMessageEvent, { type: "done" }> => event.type === "done",
+	);
+	assert.ok(doneEvent);
+	assert.equal(acquiredCredentialSelections.length, 1);
+	const textBlock = doneEvent.message.content.find(
+		(block): block is Extract<(typeof doneEvent.message.content)[number], { type: "text" }> =>
+			block.type === "text",
+	);
+	assert.ok(textBlock);
+	assert.equal(textBlock.text, "Delegated credential pinned successfully.");
 	assert.equal(events.some((event) => event.type === "error"), false);
 });
 
@@ -737,10 +830,6 @@ test("rotating stream wrapper keeps caller initiated aborts terminal", async () 
 			},
 		}) as never,
 		new Map(),
-		{
-			attemptTimeoutMs: 200,
-			idleTimeoutMs: 20,
-		},
 	);
 
 	const events = await collectAssistantEvents(
@@ -749,7 +838,14 @@ test("rotating stream wrapper keeps caller initiated aborts terminal", async () 
 			signal: abortController.signal,
 		}),
 	);
-	assert.deepEqual(events, []);
+	assert.equal(events.length, 1);
+	assert.equal(events[0]?.type, "error");
+	if (events[0]?.type !== "error") {
+		assert.fail("Expected an aborted terminal error event.");
+	}
+	assert.equal(events[0].reason, "aborted");
+	assert.equal(events[0].error.stopReason, "aborted");
+	assert.match(events[0].error.errorMessage ?? "", /aborted/i);
 	assert.deepEqual(acquiredCredentialIds, ["credential-a"]);
 	assert.equal(callsByApiKey.get("secret-a"), 1);
 	assert.equal(callsByApiKey.get("secret-b"), undefined);
@@ -852,6 +948,115 @@ test("account manager batch deletes multiple credentials and re-syncs provider s
 	assert.deepEqual(storageData.providers[providerId]?.credentialIds, [`${providerId}-1`]);
 	assert.equal(storageData.providers[providerId]?.activeIndex, 0);
 	assert.deepEqual(status.credentials.map((credential) => credential.credentialId), [`${providerId}-1`]);
+});
+
+test("account manager deduplicates Cline OAuth credentials by account identity", async (t) => {
+	const now = Date.now();
+	const { accountManager } = await createAccountManagerHarness(t, {
+		providerId: "cline",
+		authData: {
+			cline: {
+				type: "oauth",
+				access: "older-access",
+				refresh: "older-refresh",
+				expires: now + 60_000,
+				provider: "cline",
+				accountId: "acct-same",
+				userInfo: { email: "same@example.com" },
+			},
+			"cline-1": {
+				type: "oauth",
+				access: "newer-access",
+				refresh: "newer-refresh",
+				expires: now + 120_000,
+				provider: "cline",
+				accountId: "acct-same",
+				userInfo: { email: "same@example.com" },
+			},
+		},
+	});
+
+	await accountManager.ensureInitialized();
+
+	assert.deepEqual(await accountManager.listProviderCredentialIds("cline"), ["cline-1"]);
+});
+
+test("account manager updates an existing Cline OAuth credential instead of adding a duplicate login", async (t) => {
+	resetOAuthProviders();
+	t.after(() => {
+		resetOAuthProviders();
+	});
+
+	registerOAuthProvider({
+		id: "cline",
+		name: "Cline",
+		usesCallbackServer: false,
+		login: async () => ({
+			access: "new-access",
+			refresh: "new-refresh",
+			expires: Date.now() + 3_600_000,
+			provider: "cline",
+			accountId: "acct-same",
+			userInfo: { email: "same@example.com" },
+		}),
+		refreshToken: async (credentials) => credentials,
+		getApiKey: (credentials) => `workos:${credentials.access}`,
+	});
+
+	const { accountManager, authPath } = await createAccountManagerHarness(t, {
+		providerId: "cline",
+		authData: {
+			cline: {
+				type: "oauth",
+				access: "old-access",
+				refresh: "old-refresh",
+				expires: Date.now() + 60_000,
+				provider: "cline",
+				accountId: "acct-same",
+				userInfo: { email: "same@example.com" },
+			},
+		},
+	});
+
+	const result = await accountManager.loginProvider("cline", {
+		onAuth: () => {},
+		onPrompt: async () => "unused",
+	});
+	const authData = JSON.parse(await readFile(authPath, "utf-8")) as Record<string, StoredAuthCredential>;
+
+	assert.equal(result.credentialId, "cline");
+	assert.deepEqual(result.credentialIds, ["cline"]);
+	assert.deepEqual(Object.keys(authData), ["cline"]);
+	assert.equal(authData.cline?.type, "oauth");
+	assert.equal(authData.cline?.type === "oauth" ? authData.cline.access : undefined, "new-access");
+});
+
+test("account manager keeps the recovered round-robin credential active after retry selection", async (t) => {
+	const providerId = "cline";
+	registerClineOAuthProvider();
+	const primaryCredentialId = providerId;
+	const secondaryCredentialId = `${providerId}-1`;
+	const { accountManager, storagePath } = await createAccountManagerHarness(t, {
+		providerId,
+		authData: {
+			[primaryCredentialId]: { type: "api_key", key: "alpha" },
+			[secondaryCredentialId]: { type: "api_key", key: "beta" },
+		},
+	});
+
+	await accountManager.ensureInitialized();
+	const first = await accountManager.acquireCredential(providerId);
+	assert.equal(first.credentialId, primaryCredentialId);
+
+	const second = await accountManager.acquireCredential(providerId, {
+		excludedCredentialIds: new Set([first.credentialId]),
+	});
+	assert.equal(second.credentialId, secondaryCredentialId);
+
+	const storageData = JSON.parse(await readFile(storagePath, "utf-8")) as {
+		providers: Record<string, { credentialIds: string[]; activeIndex: number }>;
+	};
+	assert.equal(storageData.providers[providerId]?.activeIndex, 1);
 });
 
 test("account manager validates batch deletion requests", async (t) => {
@@ -1799,6 +2004,87 @@ test("richer quota classification drives cooldown duration and persisted quota s
 	assert.equal(stored.providers[providerId]?.quotaStates?.[providerId]?.recoveryAction.action, "wait");
 });
 
+test("account manager skips expired JWT-backed Cline API-key credentials during selection", async (t) => {
+	const providerId = "cline";
+	registerClineOAuthProvider();
+	const expiredJwt = createJwtWithExp(Math.floor(Date.now() / 1000) - 60);
+	const validJwt = createJwtWithExp(Math.floor(Date.now() / 1000) + 3_600);
+	const { accountManager } = await createAccountManagerHarness(t, {
+		providerId,
+		authData: {
+			[providerId]: {
+				type: "api_key",
+				key: `workos:${expiredJwt}`,
+			},
+			[`${providerId}-1`]: {
+				type: "api_key",
+				key: `workos:${validJwt}`,
+			},
+		},
+	});
+
+	const selected = await accountManager.acquireCredential(providerId);
+	assert.equal(selected.credentialId, `${providerId}-1`);
+
+	const status = await accountManager.getProviderStatus(providerId);
+	assert.equal(status.credentials[0]?.credentialId, providerId);
+	assert.equal(status.credentials[0]?.isExpired, true);
+	assert.ok((status.credentials[0]?.expiresAt ?? 0) <= Date.now());
+	assert.equal(status.credentials[1]?.credentialId, `${providerId}-1`);
+	assert.equal(status.credentials[1]?.isExpired, false);
+});
+
+test("manual active expired JWT-backed Cline API-key credentials raise a clear re-authentication error", async (t) => {
+	const providerId = "cline";
+	registerClineOAuthProvider();
+	const expiredJwt = createJwtWithExp(Math.floor(Date.now() / 1000) - 60);
+	const validJwt = createJwtWithExp(Math.floor(Date.now() / 1000) + 3_600);
+	const { accountManager } = await createAccountManagerHarness(t, {
+		providerId,
+		authData: {
+			[providerId]: {
+				type: "api_key",
+				key: `workos:${expiredJwt}`,
+			},
+			[`${providerId}-1`]: {
+				type: "api_key",
+				key: `workos:${validJwt}`,
+			},
+		},
+	});
+
+	await accountManager.switchActiveCredential(providerId, 0);
+	await assert.rejects(
+		accountManager.acquireCredential(providerId),
+		/expired WorkOS token|re-authenticate/i,
+	);
+});
+
+test("acquireCredential prefixes Cline OAuth access tokens for request auth", async (t) => {
+	const providerId = "cline";
+	registerClineOAuthProvider();
+	const { accountManager } = await createAccountManagerHarness(t, {
+		providerId,
+		authData: {
+			[providerId]: {
+				type: "oauth",
+				access: "access-token",
+				refresh: "refresh-token",
+				expires: Date.now() + 3_600_000,
+				accountId: "usr_123",
+				provider: "cline",
+				userInfo: {
+					email: "person@example.com",
+					displayName: "Person Example",
+				},
+			},
+		},
+	});
+
+	const selected = await accountManager.acquireCredential(providerId);
+	assert.equal(selected.secret, "workos:access-token");
+});
+
 test("oauth helpers prefer JWT expiration and scheduler refreshes credentials pre-emptively", async () => {
 	const expiresAtSeconds = Math.floor((Date.now() + 60_000) / 1_000);
 	const jwt = createJwtWithExp(expiresAtSeconds);
@@ -1874,6 +2160,101 @@ test("oauth refresh scheduler defers excess due work until concurrency is availa
 	assert.deepEqual(refreshCalls, ["oauth-a", "oauth-b"]);
 });
 
+test("shared auth error helpers normalize structured refresh failures safely", () => {
+	assert.equal(getErrorMessage(new Error("boom")), "boom");
+	assert.equal(getErrorMessage("string failure"), "string failure");
+	assert.equal(
+		getErrorMessage({ code: "boom" }, { preserveStructuredData: true }),
+		'{"code":"boom"}',
+	);
+	const circular: Record<string, unknown> = {};
+	circular.self = circular;
+	assert.equal(getErrorMessage(circular, { preserveStructuredData: true }), "[object Object]");
+	assert.equal(isRecord({ ok: true }), true);
+	assert.equal(isRecord(["nope"]), false);
+	assert.equal(isRecord(null), false);
+	assert.deepEqual(inferOAuthRefreshFailureMetadata("invalid_grant: refresh token expired"), {
+		errorCode: "invalid_grant",
+		reason: "token_rejected",
+		permanent: true,
+	});
+	assert.equal(
+		formatOAuthRefreshFailureSummary({
+			providerLabel: "OpenAI Codex",
+			status: 400,
+			errorCode: "invalid_grant",
+			reason: "token_rejected",
+			permanent: true,
+			source: "extension",
+		}),
+		"OpenAI Codex refresh rejected permanently (HTTP 400, code=invalid_grant)",
+	);
+});
+
+test("async buffered log writer hardens debug log permissions after append", async (t) => {
+	const tempDir = await mkdtemp(join(tmpdir(), "pi-multi-auth-debug-log-"));
+	t.after(async () => {
+		await rm(tempDir, { recursive: true, force: true });
+	});
+
+	const logPath = join(tempDir, "debug.log");
+	await writeFile(logPath, "existing\n", "utf-8");
+	if (process.platform !== "win32") {
+		await chmod(logPath, 0o644);
+	}
+
+	const writer = new AsyncBufferedLogWriter({
+		enabled: true,
+		logPath,
+		ensureDirectory: () => undefined,
+		flushIntervalMs: 60_000,
+	});
+
+	assert.equal(writer.writeLine("appended"), undefined);
+	await writer.flush();
+
+	assert.equal(await readFile(logPath, "utf-8"), "existing\nappended\n");
+	if (process.platform !== "win32") {
+		assert.equal((await stat(logPath)).mode & 0o777, 0o600);
+	}
+});
+
+test("openai codex refresh failures omit raw response bodies from error details and messages", async (t) => {
+	const originalFetch = globalThis.fetch;
+	t.after(() => {
+		globalThis.fetch = originalFetch;
+	});
+
+	globalThis.fetch = async () =>
+		new Response(
+			JSON.stringify({
+				unexpected: "access_token=raw-secret-token",
+				note: "refresh_token=raw-refresh-token",
+			}),
+			{
+				status: 400,
+				headers: { "Content-Type": "application/json" },
+			},
+		);
+
+	await assert.rejects(
+		() =>
+			refreshOAuthCredential("openai-codex", {
+				access: "stale-access-token",
+				refresh: "refresh-token",
+				expires: Date.now() - 60_000,
+			}),
+		(error: unknown) => {
+			assert.ok(error instanceof OAuthRefreshFailureError);
+			assert.equal(error.details.status, 400);
+			assert.equal(error.details.reason, "http_error");
+			assert.equal(error.details.errorCode, undefined);
+			assert.doesNotMatch(error.message, /raw-secret-token|raw-refresh-token|access_token|refresh_token/i);
+			return true;
+		},
+	);
+});
+
 test("oauth refresh scheduler stops retrying after permanent refresh failures", async () => {
 	let attempts = 0;
 	const scheduler = new OAuthRefreshScheduler(
@@ -1937,7 +2318,8 @@ test("account manager handles permanent Codex refresh failures without console n
 		new Response(
 			JSON.stringify({
 				error: "invalid_grant",
-				error_description: "Refresh token has expired or was revoked.",
+				error_description: "Refresh token raw-refresh-token-123 has expired or was revoked.",
+				access_token: "raw-access-token-123",
 			}),
 			{
 				status: 400,
@@ -1982,10 +2364,18 @@ test("account manager handles permanent Codex refresh failures without console n
 	assert.equal(refreshFailureLog?.payload.permanent, true);
 	assert.equal(refreshFailureLog?.payload.status, 400);
 	assert.equal(refreshFailureLog?.payload.errorCode, "invalid_grant");
+	assert.equal(refreshFailureLog?.payload.reason, "token_rejected");
+	assert.equal("errorDescription" in (refreshFailureLog?.payload ?? {}), false);
+	assert.equal("responseBody" in (refreshFailureLog?.payload ?? {}), false);
 	assert.ok(cooldownLog);
 	assert.ok(typeof quotaExhaustedUntil === "number");
 	assert.ok(quotaExhaustedUntil > Date.now());
 	assert.match(lastQuotaError ?? "", /invalid_grant/);
+	assert.doesNotMatch(lastQuotaError ?? "", /raw-refresh-token-123|raw-access-token-123|revoked/i);
+	assert.doesNotMatch(
+		String(refreshFailureLog?.payload.message ?? ""),
+		/raw-refresh-token-123|raw-access-token-123|revoked/i,
+	);
 	// Credential should NOT be disabled for openai-codex
 	assert.equal(disabledEntry, undefined);
 	assert.deepEqual(stored.providers[providerId]?.oauthRefreshScheduled ?? {}, {});
@@ -2043,6 +2433,55 @@ test("account manager disables background oauth scheduling when configured", asy
 		providers: Record<string, { oauthRefreshScheduled?: Record<string, number> }>;
 	};
 	assert.deepEqual(stored.providers[providerId]?.oauthRefreshScheduled ?? {}, {});
+});
+
+test("account manager schedules cline oauth refresh and clears stale refresh disable state", async (t) => {
+	const providerId = "cline";
+	const expiresAt = Date.now() + 10 * 60_000;
+	const jwt = createJwtWithExp(Math.floor(expiresAt / 1_000));
+	const { accountManager, authPath, storagePath } = await createAccountManagerHarness(t, {
+		providerId,
+		authData: {
+			[providerId]: {
+				type: "oauth",
+				access: jwt,
+				refresh: "refresh-token",
+				expires: expiresAt,
+				provider: providerId,
+			},
+		},
+	});
+	const staleState = createDefaultMultiAuthState([providerId]);
+	const clineState = getProviderState(staleState, providerId);
+	clineState.credentialIds = [providerId];
+	clineState.disabledCredentials[providerId] = {
+		error: "Failed to refresh OAuth token for cline: cline refresh rejected permanently (HTTP 400, code=failed_to_refresh_token)",
+		disabledAt: Date.now(),
+	};
+	clineState.oauthRefreshScheduled = {
+		[providerId]: Date.now() + 60_000,
+	};
+	await writeFile(storagePath, JSON.stringify(staleState, null, 2), "utf-8");
+
+	await accountManager.ensureInitialized();
+
+	const stored = JSON.parse(await readFile(storagePath, "utf-8")) as {
+		providers: Record<
+			string,
+			{
+				disabledCredentials?: Record<string, { error: string; disabledAt: number }>;
+				oauthRefreshScheduled?: Record<string, number>;
+			}
+		>;
+	};
+	assert.deepEqual(stored.providers[providerId]?.disabledCredentials ?? {}, {});
+	const scheduledAt = stored.providers[providerId]?.oauthRefreshScheduled?.[providerId];
+	assert.ok(typeof scheduledAt === "number");
+	assert.ok(scheduledAt <= expiresAt - 5 * 60_000 + 1_000);
+	assert.ok(scheduledAt >= Date.now());
+
+	const authAfterInitialization = await readFile(authPath, "utf-8");
+	assert.match(authAfterInitialization, /refresh-token/);
 });
 
 test("account manager getProviderStatus avoids rewriting unchanged multi-auth state", async (t) => {

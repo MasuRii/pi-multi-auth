@@ -10,6 +10,13 @@ import { AuthWriter } from "../src/auth-writer.js";
 import { DEFAULT_MULTI_AUTH_CONFIG, loadMultiAuthConfig } from "../src/config.js";
 import { MultiAuthDebugLogger } from "../src/debug-logger.js";
 import { ProviderRegistry } from "../src/provider-registry.js";
+import {
+	PI_AGENT_ROUTER_DELEGATED_API_KEY_ENV,
+	PI_AGENT_ROUTER_DELEGATED_CREDENTIAL_ID_ENV,
+	PI_AGENT_ROUTER_DELEGATED_PROVIDER_ID_ENV,
+	PI_AGENT_ROUTER_SUBAGENT_ENV,
+	resolveDelegatedCredentialOverride,
+} from "../src/runtime-context.js";
 import { MultiAuthStorage } from "../src/storage.js";
 import { UsageService } from "../src/usage/index.js";
 
@@ -150,6 +157,30 @@ test("pi-multi-auth starts startup warmup only after session_start", () => {
 	assert.deepEqual(result.autoActivateCallOptions, [{ avoidUsageApi: true }]);
 });
 
+test("delegated subagent runtime resolves the router-provided credential override", () => {
+	const override = resolveDelegatedCredentialOverride("openai-codex", {
+		[PI_AGENT_ROUTER_SUBAGENT_ENV]: "1",
+		[PI_AGENT_ROUTER_DELEGATED_PROVIDER_ID_ENV]: "openai-codex",
+		[PI_AGENT_ROUTER_DELEGATED_CREDENTIAL_ID_ENV]: "openai-codex-4",
+		[PI_AGENT_ROUTER_DELEGATED_API_KEY_ENV]: "delegated-secret",
+	});
+
+	assert.deepEqual(override, {
+		providerId: "openai-codex",
+		credentialId: "openai-codex-4",
+		apiKey: "delegated-secret",
+	});
+	assert.equal(
+		resolveDelegatedCredentialOverride("github-copilot", {
+			[PI_AGENT_ROUTER_SUBAGENT_ENV]: "1",
+			[PI_AGENT_ROUTER_DELEGATED_PROVIDER_ID_ENV]: "openai-codex",
+			[PI_AGENT_ROUTER_DELEGATED_CREDENTIAL_ID_ENV]: "openai-codex-4",
+			[PI_AGENT_ROUTER_DELEGATED_API_KEY_ENV]: "delegated-secret",
+		}),
+		undefined,
+	);
+});
+
 test("multi-auth config initializes with documented module defaults", async (t) => {
 	const tempRoot = await mkdtemp(join(tmpdir(), "pi-multi-auth-config-"));
 	t.after(async () => {
@@ -168,7 +199,7 @@ test("multi-auth config initializes with documented module defaults", async (t) 
 	assert.match(configContent, /"health": \{/);
 	assert.match(configContent, /"historyPersistence": \{/);
 	assert.match(configContent, /"oauthRefresh": \{/);
-	assert.match(configContent, /"streamTimeouts": \{/);
+	assert.match(configContent, /"excludedProviders": \[\]/);
 });
 
 
@@ -215,10 +246,7 @@ test("multi-auth config validates nested documented options and falls back with 
 					checkIntervalMs: 0,
 					maxConcurrentRefreshes: 0,
 					enabled: "sometimes",
-				},
-				streamTimeouts: {
-					attemptTimeoutMs: 0,
-					idleTimeoutMs: -1,
+					excludedProviders: ["cline", 42, "   "],
 				},
 			},
 			null,
@@ -247,8 +275,10 @@ test("multi-auth config validates nested documented options and falls back with 
 		configResult.config.historyPersistence,
 		DEFAULT_MULTI_AUTH_CONFIG.historyPersistence,
 	);
-	assert.deepEqual(configResult.config.oauthRefresh, DEFAULT_MULTI_AUTH_CONFIG.oauthRefresh);
-	assert.deepEqual(configResult.config.streamTimeouts, DEFAULT_MULTI_AUTH_CONFIG.streamTimeouts);
+	assert.deepEqual(configResult.config.oauthRefresh, {
+		...DEFAULT_MULTI_AUTH_CONFIG.oauthRefresh,
+		excludedProviders: ["cline"],
+	});
 	assert.match(configResult.warning ?? "", /debug/);
 	assert.match(configResult.warning ?? "", /excludeProviders/);
 	assert.match(configResult.warning ?? "", /cascade\.initialBackoffMs/);
@@ -257,8 +287,7 @@ test("multi-auth config validates nested documented options and falls back with 
 	assert.match(configResult.warning ?? "", /historyPersistence\.healthFileName/);
 	assert.match(configResult.warning ?? "", /historyPersistence\.cascadeFileName/);
 	assert.match(configResult.warning ?? "", /oauthRefresh\.enabled/);
-	assert.match(configResult.warning ?? "", /streamTimeouts\.attemptTimeoutMs/);
-	assert.match(configResult.warning ?? "", /streamTimeouts\.idleTimeoutMs/);
+	assert.match(configResult.warning ?? "", /oauthRefresh\.excludedProviders/);
 });
 
 test("multi-auth config accepts custom history persistence file names", async (t) => {
