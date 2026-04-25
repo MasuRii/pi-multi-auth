@@ -1,3 +1,4 @@
+import { getErrorMessage } from "./auth-error-utils.js";
 import {
 	DEFAULT_OAUTH_CONFIG,
 	isOAuthRefreshFailureError,
@@ -23,6 +24,14 @@ function normalizePositiveInteger(value: number | undefined, fallback: number): 
 		: fallback;
 }
 
+function normalizeExcludedProviders(value: string[] | undefined): string[] {
+	if (!Array.isArray(value)) {
+		return [...DEFAULT_OAUTH_CONFIG.excludedProviders];
+	}
+
+	return [...new Set(value.map((entry) => entry.trim()).filter((entry) => entry.length > 0))];
+}
+
 function normalizeOAuthRefreshConfig(config: Partial<OAuthRefreshConfig>): OAuthRefreshConfig {
 	return {
 		enabled: config.enabled ?? DEFAULT_OAUTH_CONFIG.enabled,
@@ -46,6 +55,7 @@ function normalizeOAuthRefreshConfig(config: Partial<OAuthRefreshConfig>): OAuth
 			config.requestTimeoutMs,
 			DEFAULT_OAUTH_CONFIG.requestTimeoutMs,
 		),
+		excludedProviders: normalizeExcludedProviders(config.excludedProviders),
 	};
 }
 
@@ -103,7 +113,7 @@ export type OAuthRefreshHandler = (
 ) => Promise<number | undefined>;
 
 export class OAuthRefreshScheduler {
-	private readonly config: OAuthRefreshConfig;
+	private config: OAuthRefreshConfig;
 	private readonly scheduled = new Map<string, ScheduledRefresh>();
 	private readonly pendingRefreshes = new Set<string>();
 	private wakeTimer: ReturnType<typeof setTimeout> | null = null;
@@ -118,6 +128,18 @@ export class OAuthRefreshScheduler {
 			...DEFAULT_OAUTH_CONFIG,
 			...config,
 		});
+	}
+
+	updateConfig(config: Partial<OAuthRefreshConfig>): void {
+		this.config = normalizeOAuthRefreshConfig({
+			...DEFAULT_OAUTH_CONFIG,
+			...config,
+		});
+		if (this.config.enabled && !this.started) {
+			this.start();
+		} else if (!this.config.enabled && this.started) {
+			this.stop();
+		}
 	}
 
 	start(): void {
@@ -341,7 +363,7 @@ export class OAuthRefreshScheduler {
 			return {
 				credentialId,
 				success: false,
-				error: error instanceof Error ? error.message : String(error),
+				error: getErrorMessage(error),
 				attemptedAt: Date.now(),
 			};
 		}

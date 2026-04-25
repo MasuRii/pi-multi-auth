@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
-import type { StoredAuthCredential } from "./types.js";
+import { getOAuthProvider } from "./oauth-compat.js";
+import { extractJwtExpiration } from "./oauth-refresh-scheduler.js";
+import type { StoredApiKeyCredential, StoredAuthCredential, SupportedProviderId } from "./types.js";
 
 function fingerprint(secret: string): string {
 	return createHash("sha256").update(secret).digest("hex").slice(0, 10);
@@ -22,6 +24,64 @@ function redact(secret: string): string {
 
 export function getCredentialSecret(credential: StoredAuthCredential): string {
 	return credential.type === "oauth" ? credential.access : credential.key;
+}
+
+function getClineWorkosJwtExpiration(credential: StoredApiKeyCredential): number | null {
+	const normalizedKey = credential.key.trim();
+	if (!normalizedKey.startsWith("workos:")) {
+		return null;
+	}
+
+	const token = normalizedKey.slice("workos:".length).trim();
+	return token ? extractJwtExpiration(token) : null;
+}
+
+export function getCredentialExpiration(
+	provider: SupportedProviderId,
+	credential: StoredAuthCredential,
+): number | null {
+	if (credential.type === "oauth") {
+		return credential.expires;
+	}
+
+	if (provider === "cline") {
+		return getClineWorkosJwtExpiration(credential);
+	}
+
+	return null;
+}
+
+export function isExpiredApiKeyCredential(
+	provider: SupportedProviderId,
+	credential: StoredAuthCredential,
+	now: number = Date.now(),
+): boolean {
+	if (credential.type !== "api_key") {
+		return false;
+	}
+
+	const expiresAt = getCredentialExpiration(provider, credential);
+	return expiresAt !== null && expiresAt <= now;
+}
+
+export function getCredentialRequestSecret(
+	provider: SupportedProviderId,
+	credential: StoredAuthCredential,
+): string {
+	if (credential.type !== "oauth") {
+		return credential.key;
+	}
+
+	if (provider === "cline") {
+		return `workos:${credential.access}`;
+	}
+
+	const oauthProvider = getOAuthProvider(provider);
+	if (!oauthProvider) {
+		return credential.access;
+	}
+
+	return oauthProvider.getApiKey(credential);
 }
 
 export function formatCredentialRedaction(credential: StoredAuthCredential): string {

@@ -1,6 +1,15 @@
 import type { SupportedProviderId } from "./types.js";
 
 export const PI_AGENT_ROUTER_SUBAGENT_ENV = "PI_AGENT_ROUTER_SUBAGENT";
+export const PI_AGENT_ROUTER_DELEGATED_PROVIDER_ID_ENV = "PI_AGENT_ROUTER_DELEGATED_PROVIDER_ID";
+export const PI_AGENT_ROUTER_DELEGATED_CREDENTIAL_ID_ENV = "PI_AGENT_ROUTER_DELEGATED_CREDENTIAL_ID";
+export const PI_AGENT_ROUTER_DELEGATED_API_KEY_ENV = "PI_AGENT_ROUTER_DELEGATED_API_KEY";
+
+export interface DelegatedCredentialOverride {
+	providerId: SupportedProviderId;
+	credentialId: string;
+	apiKey: string;
+}
 
 function normalizeProviderId(providerId: string | undefined): SupportedProviderId | undefined {
 	if (typeof providerId !== "string") {
@@ -8,6 +17,15 @@ function normalizeProviderId(providerId: string | undefined): SupportedProviderI
 	}
 
 	const normalized = providerId.trim().toLowerCase();
+	return normalized.length > 0 ? normalized : undefined;
+}
+
+function normalizeEnvValue(value: string | undefined): string | undefined {
+	if (typeof value !== "string") {
+		return undefined;
+	}
+
+	const normalized = value.trim();
 	return normalized.length > 0 ? normalized : undefined;
 }
 
@@ -48,4 +66,34 @@ export function resolveRequestedProviderFromArgv(
 	}
 
 	return undefined;
+}
+
+export function resolveDelegatedCredentialOverride(
+	providerId?: SupportedProviderId,
+	env: NodeJS.ProcessEnv = process.env,
+): DelegatedCredentialOverride | undefined {
+	if (!isDelegatedSubagentRuntime(env)) {
+		return undefined;
+	}
+
+	const delegatedProviderId = normalizeProviderId(env[PI_AGENT_ROUTER_DELEGATED_PROVIDER_ID_ENV]);
+	const expectedProviderId = normalizeProviderId(providerId);
+	if (!delegatedProviderId) {
+		return undefined;
+	}
+	if (expectedProviderId && delegatedProviderId !== expectedProviderId) {
+		return undefined;
+	}
+
+	const credentialId = normalizeEnvValue(env[PI_AGENT_ROUTER_DELEGATED_CREDENTIAL_ID_ENV]);
+	const apiKey = normalizeEnvValue(env[PI_AGENT_ROUTER_DELEGATED_API_KEY_ENV]);
+	if (!credentialId || !apiKey) {
+		return undefined;
+	}
+
+	return {
+		providerId: delegatedProviderId,
+		credentialId,
+		apiKey,
+	};
 }

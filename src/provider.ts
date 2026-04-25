@@ -15,21 +15,16 @@ import {
 	AccountManager,
 	createCredentialSelectionCache,
 } from "./account-manager.js";
+import { getErrorMessage, isAbortError } from "./auth-error-utils.js";
 import {
 	classifyCredentialError,
 	isRetryableModelAvailabilityError,
 	type CredentialErrorKind,
 } from "./error-classifier.js";
+import { buildClineClientHeaders } from "./cline-compat.js";
 import { multiAuthDebugLogger } from "./debug-logger.js";
 import { ProviderRegistry } from "./provider-registry.js";
-import {
-	createStreamAttemptWatchdog,
-	type StreamAttemptWatchdog,
-} from "./stream-watchdog.js";
-import {
-	DEFAULT_STREAM_TIMEOUT_CONFIG,
-	type StreamTimeoutConfig,
-} from "./types-stream-timeout.js";
+import { resolveDelegatedCredentialOverride } from "./runtime-context.js";
 import type {
 	ProviderRegistrationMetadata,
 	SupportedProviderId,
@@ -64,39 +59,29 @@ const providerRegistrationMetrics = {
 	providers: new Map<string, ProviderRegistrationMetricState>(),
 };
 
-function getErrorMessage(error: unknown): string {
-	if (error instanceof Error) {
-		return error.message;
-	}
-	if (typeof error === "string") {
-		return error;
-	}
-	try {
-		return JSON.stringify(error);
-	} catch {
-		return String(error);
-	}
-}
+const STRUCTURED_ERROR_MESSAGE_OPTIONS = {
+	preserveStructuredData: true,
+} as const;
 
 function getAssistantErrorMessage(error: AssistantMessage): string {
 	if (typeof error.errorMessage === "string" && error.errorMessage.trim().length > 0) {
 		return error.errorMessage;
 	}
-	return getErrorMessage(error);
+	return getErrorMessage(error, STRUCTURED_ERROR_MESSAGE_OPTIONS);
 }
 
-function resolveAttemptFailureError(
-	watchdog: StreamAttemptWatchdog,
-	failure: unknown,
-): unknown {
-	return watchdog.getTimeoutError() ?? failure;
+function isCallerAbort(parentSignal: AbortSignal | undefined, error?: unknown): boolean {
+	if (!parentSignal?.aborted) {
+		return false;
+	}
+	if (error === undefined) {
+		return true;
+	}
+	return isAbortError(error);
 }
 
-function resolveAttemptFailureMessage(
-	watchdog: StreamAttemptWatchdog,
-	failure: unknown,
-): string {
-	return getErrorMessage(resolveAttemptFailureError(watchdog, failure));
+function isCallerAbortMessage(parentSignal: AbortSignal | undefined, message: string): boolean {
+	return Boolean(parentSignal?.aborted) && isAbortError(message);
 }
 
 function getOrCreateProviderRegistrationMetricState(
@@ -199,6 +184,19 @@ function stripAnsi(text: string): string {
 
 function isOllamaProvider(provider: SupportedProviderId): boolean {
 	return provider.trim().toLowerCase() === "ollama";
+}
+
+function resolveProviderRequestHeaders(
+	provider: SupportedProviderId,
+	headers: SimpleStreamOptions["headers"],
+): SimpleStreamOptions["headers"] {
+	if (provider !== "cline") {
+		return headers;
+	}
+	return {
+		...headers,
+		...buildClineClientHeaders({ includeRequestTracking: true }),
+	};
 }
 
 function isMalformedThinkingText(text: string): boolean {
@@ -319,6 +317,56 @@ function createBufferedThinkingState(): BufferedThinkingGuardState {
 	};
 }
 
+function hasMeaningfulAssistantContent(message: AssistantMessage): boolean {
+	return message.content.some((block) => {
+		switch (block.type) {
+			case "text":
+				return block.text.trim().length > 0;
+			case "thinking":
+				return block.thinking.trim().length > 0;
+			case "toolCall":
+				return true;
+			default:
+				return true;
+		}
+	});
+}
+
+function getAssistantOutputTokens(message: AssistantMessage): number | null {
+	return typeof message.usage.output === "number" && Number.isFinite(message.usage.output)
+		? message.usage.output
+		: null;
+}
+
+function isRetryableEmptyCompletion(
+	event: Extract<AssistantMessageEvent, { type: "done" }>,
+	hasForwardedSubstantiveEvent: boolean,
+): boolean {
+	return (
+		!hasForwardedSubstantiveEvent &&
+		event.reason === "stop" &&
+		event.message.stopReason === "stop" &&
+		!hasMeaningfulAssistantContent(event.message)
+	);
+}
+
+function createEmptyCompletionErrorMessage(
+	provider: SupportedProviderId,
+	credentialId: string,
+	message: AssistantMessage,
+): string {
+	const metadata: string[] = [];
+	if (typeof message.responseId === "string" && message.responseId.trim().length > 0) {
+		metadata.push(`responseId=${message.responseId.trim()}`);
+	}
+	const outputTokens = getAssistantOutputTokens(message);
+	if (outputTokens !== null) {
+		metadata.push(`outputTokens=${outputTokens}`);
+	}
+
+	return `Provider stream ended unexpectedly with empty completion for ${provider} (credential ${credentialId}, model ${message.model})${metadata.length > 0 ? ` [${metadata.join(", ")}]` : ""}.`;
+}
+
 function flushBufferedThinkingEvents(
 	state: BufferedThinkingGuardState,
 	provider: SupportedProviderId,
@@ -433,6 +481,13 @@ function createErrorAssistantMessage(model: Model<Api>, message: string): Assist
 	};
 }
 
+function createAbortedAssistantMessage(model: Model<Api>, message: string): AssistantMessage {
+	return {
+		...createErrorAssistantMessage(model, message),
+		stopReason: "aborted",
+	};
+}
+
 function resolveCredentialProviderId(
 	model: Model<Api>,
 	fallbackProvider: SupportedProviderId,
@@ -451,7 +506,6 @@ export function createRotatingStreamWrapper(
 	accountManager: AccountManager,
 	baseProvider: ApiProviderRef,
 	baseProvidersByApi: ReadonlyMap<Api, ApiProviderRef> = new Map(),
-	streamTimeoutConfig: StreamTimeoutConfig = DEFAULT_STREAM_TIMEOUT_CONFIG,
 ): (
 	model: Model<Api>,
 	context: Context,
@@ -479,6 +533,19 @@ export function createRotatingStreamWrapper(
 			let lastFailoverTrigger: CredentialErrorKind | null = null;
 			const selectionCache = createCredentialSelectionCache();
 			const bufferedThinkingState = createBufferedThinkingState();
+			const emitAbortedTermination = (reason?: unknown): void => {
+				const fallbackMessage = `multi-auth request aborted for ${activeProviderId}.`;
+				const message = reason === undefined
+					? fallbackMessage
+					: getErrorMessage(reason, STRUCTURED_ERROR_MESSAGE_OPTIONS) || fallbackMessage;
+				const assistantAbort: AssistantMessageEvent = {
+					type: "error",
+					reason: "aborted",
+					error: createAbortedAssistantMessage(activeModel, message),
+				};
+				stream.push(assistantAbort);
+				stream.end(assistantAbort.error);
+			};
 
 			const switchToFailoverProvider = async (): Promise<boolean> => {
 				if (!lastFailoverTrigger) {
@@ -524,21 +591,58 @@ export function createRotatingStreamWrapper(
 			};
 
 			for (let attempt = 0; attempt <= MAX_ROTATION_RETRIES; attempt += 1) {
+				const delegatedCredentialOverride = resolveDelegatedCredentialOverride(activeProviderId);
+				const useDelegatedCredentialOverride = delegatedCredentialOverride !== undefined;
 				let selected;
 				try {
-					selected = await accountManager.acquireCredential(activeProviderId, {
-						excludedCredentialIds,
-						modelId: activeModel.id,
-						selectionCache,
-					});
+					if (delegatedCredentialOverride) {
+						const providerCredentialIds = await accountManager.listProviderCredentialIds(
+							activeProviderId,
+						);
+						if (!providerCredentialIds.includes(delegatedCredentialOverride.credentialId)) {
+							throw new Error(
+								`Delegated credential '${delegatedCredentialOverride.credentialId}' is not available for ${activeProviderId}.`,
+							);
+						}
+
+						const pinnedExcludedCredentialIds = new Set(excludedCredentialIds);
+						for (const credentialId of providerCredentialIds) {
+							if (credentialId !== delegatedCredentialOverride.credentialId) {
+								pinnedExcludedCredentialIds.add(credentialId);
+							}
+						}
+
+						selected = await accountManager.acquireCredential(activeProviderId, {
+							excludedCredentialIds: pinnedExcludedCredentialIds,
+							modelId: activeModel.id,
+							selectionCache,
+							signal: options?.signal,
+						});
+						multiAuthDebugLogger.log("delegated_credential_override_applied", {
+							provider: activeProviderId,
+							credentialId: delegatedCredentialOverride.credentialId,
+							model: activeModel.id,
+						});
+					} else {
+						selected = await accountManager.acquireCredential(activeProviderId, {
+							excludedCredentialIds,
+							modelId: activeModel.id,
+							selectionCache,
+							signal: options?.signal,
+						});
+					}
 				} catch (error: unknown) {
+					if (options?.signal?.aborted && isAbortError(error)) {
+						emitAbortedTermination(options.signal.reason ?? error);
+						return;
+					}
 					if (excludedCredentialIds.size > 0 && (await switchToFailoverProvider())) {
 						continue;
 					}
 					if (excludedCredentialIds.size > 0) {
 						const lastDetail = lastRetryableMessage
 							? ` Last retryable error: ${lastRetryableMessage}`
-							: ` Credential acquisition error: ${getErrorMessage(error)}`;
+							: ` Credential acquisition error: ${getErrorMessage(error, STRUCTURED_ERROR_MESSAGE_OPTIONS)}`;
 						throw new Error(
 							`All ${excludedCredentialIds.size} rotated credential(s) for ${activeProviderId} failed.${lastDetail}`,
 						);
@@ -582,7 +686,7 @@ export function createRotatingStreamWrapper(
 							multiAuthDebugLogger.log("credential_disable_failed", {
 								provider: activeProviderId,
 								credentialId: selected.credentialId,
-								error: getErrorMessage(error),
+								error: getErrorMessage(error, STRUCTURED_ERROR_MESSAGE_OPTIONS),
 							});
 						}
 					}
@@ -605,6 +709,10 @@ export function createRotatingStreamWrapper(
 						!hasForwardedSubstantiveEvent &&
 						attempt < MAX_ROTATION_RETRIES
 					) {
+						lastRetryableMessage = message;
+						if (useDelegatedCredentialOverride) {
+							return "fail";
+						}
 						const cooldownMs = await accountManager.markTransientProviderError(
 							activeProviderId,
 							selected.credentialId,
@@ -617,7 +725,6 @@ export function createRotatingStreamWrapper(
 							reason: message.slice(0, 200),
 						});
 						excludedCredentialIds.add(selected.credentialId);
-						lastRetryableMessage = message;
 						return "rotate_credential";
 					}
 
@@ -625,6 +732,10 @@ export function createRotatingStreamWrapper(
 						classification.shouldRotateCredential &&
 						attempt < MAX_ROTATION_RETRIES
 					) {
+						lastRetryableMessage = message;
+						if (useDelegatedCredentialOverride) {
+							return "fail";
+						}
 						if (classification.shouldApplyCooldown) {
 							await accountManager.markQuotaExceeded(
 								activeProviderId,
@@ -656,7 +767,6 @@ export function createRotatingStreamWrapper(
 						}
 						lastFailoverTrigger = classification.kind;
 						excludedCredentialIds.add(selected.credentialId);
-						lastRetryableMessage = message;
 						return "rotate_credential";
 					}
 
@@ -670,28 +780,32 @@ export function createRotatingStreamWrapper(
 				) {
 					resetBufferedThinkingState(bufferedThinkingState);
 					const requestStartedAt = Date.now();
-					const watchdog = createStreamAttemptWatchdog({
-						providerId: activeProviderId,
-						credentialId: selected.credentialId,
-						modelId: activeModel.id,
-						timeoutConfig: streamTimeoutConfig,
-						parentSignal: options?.signal,
-					});
 					let innerStream: AssistantMessageEventStream;
 					try {
+						multiAuthDebugLogger.log("stream_request_auth", {
+							provider: activeProviderId,
+							credentialId: selected.credentialId,
+							credentialType: useDelegatedCredentialOverride
+								? "delegated"
+								: selected.credential?.type ?? "unknown",
+							secretPrefix: selected.secret.slice(0, 12),
+							secretStartsWithWorkos: selected.secret.startsWith("workos:"),
+							model: activeModel.id,
+							baseUrl: activeModel.baseUrl,
+							api: activeModel.api,
+						});
 						innerStream = activeBaseProvider.streamSimple(activeModel, context, {
 							...options,
 							apiKey: selected.secret,
-							signal: watchdog.signal,
+							headers: resolveProviderRequestHeaders(activeProviderId, options?.headers),
+							signal: options?.signal,
 						});
 					} catch (error: unknown) {
-						watchdog.dispose();
-						if (watchdog.isCallerAbort(error)) {
-							stream.end();
+						if (isCallerAbort(options?.signal, error)) {
+							emitAbortedTermination(options?.signal?.reason ?? error);
 							return;
 						}
-						const retryError = resolveAttemptFailureError(watchdog, error);
-						const message = getErrorMessage(retryError);
+						const message = getErrorMessage(error, STRUCTURED_ERROR_MESSAGE_OPTIONS);
 						const decision = await resolveRetryDecision(
 							message,
 							false,
@@ -703,7 +817,7 @@ export function createRotatingStreamWrapper(
 						if (decision === "rotate_credential") {
 							break;
 						}
-						throw retryError;
+						throw error;
 					}
 
 					let forwardedAnyEvent = false;
@@ -714,7 +828,6 @@ export function createRotatingStreamWrapper(
 
 					try {
 						for await (const rawEvent of innerStream) {
-							watchdog.touch();
 							const forwardedEvents = sanitizeOllamaThinkingEvent(
 								rawEvent,
 								activeProviderId,
@@ -722,16 +835,12 @@ export function createRotatingStreamWrapper(
 							);
 							for (const event of forwardedEvents) {
 								if (event.type === "error") {
-									if (
-										watchdog.isCallerAbortMessage(getAssistantErrorMessage(event.error))
-									) {
-										stream.end();
+									const assistantErrorMessage = getAssistantErrorMessage(event.error);
+									if (isCallerAbortMessage(options?.signal, assistantErrorMessage)) {
+										emitAbortedTermination(options?.signal?.reason ?? event.error.errorMessage);
 										return;
 									}
-									const message = resolveAttemptFailureMessage(
-										watchdog,
-										getAssistantErrorMessage(event.error),
-									);
+									const message = assistantErrorMessage;
 									const decision = await resolveRetryDecision(
 										message,
 										hasForwardedSubstantiveEvent,
@@ -749,6 +858,43 @@ export function createRotatingStreamWrapper(
 									stream.push(event);
 									stream.end();
 									return;
+								}
+
+								if (
+									event.type === "done" &&
+									isRetryableEmptyCompletion(
+										event,
+										hasForwardedSubstantiveEvent,
+									)
+								) {
+									const message = createEmptyCompletionErrorMessage(
+										activeProviderId,
+										selected.credentialId,
+										event.message,
+									);
+									multiAuthDebugLogger.log("empty_completion_detected", {
+										provider: activeProviderId,
+										credentialId: selected.credentialId,
+										model: event.message.model,
+										responseId: event.message.responseId,
+										outputTokens: getAssistantOutputTokens(event.message),
+										contentBlockCount: event.message.content.length,
+										stopReason: event.message.stopReason,
+									});
+									const decision = await resolveRetryDecision(
+										message,
+										hasForwardedSubstantiveEvent,
+										transientAttempt,
+									);
+									if (decision === "retry_same_credential") {
+										shouldRetrySameCredential = true;
+										break;
+									}
+									if (decision === "rotate_credential") {
+										shouldRotateCredential = true;
+										break;
+									}
+									throw new Error(message);
 								}
 
 								forwardedAnyEvent = true;
@@ -771,12 +917,11 @@ export function createRotatingStreamWrapper(
 							}
 						}
 					} catch (error: unknown) {
-						if (watchdog.isCallerAbort(error)) {
-							stream.end();
+						if (isCallerAbort(options?.signal, error)) {
+							emitAbortedTermination(options?.signal?.reason ?? error);
 							return;
 						}
-						const retryError = resolveAttemptFailureError(watchdog, error);
-						const message = getErrorMessage(retryError);
+						const message = getErrorMessage(error, STRUCTURED_ERROR_MESSAGE_OPTIONS);
 						const decision = await resolveRetryDecision(
 							message,
 							hasForwardedSubstantiveEvent,
@@ -787,10 +932,8 @@ export function createRotatingStreamWrapper(
 						} else if (decision === "rotate_credential") {
 							shouldRotateCredential = true;
 						} else {
-							throw retryError;
+							throw error;
 						}
-					} finally {
-						watchdog.dispose();
 					}
 
 					if (shouldRetrySameCredential) {
@@ -802,16 +945,13 @@ export function createRotatingStreamWrapper(
 					}
 
 					if (!sawDoneEvent) {
-						if (options?.signal?.aborted && !watchdog.getTimeoutError()) {
-							stream.end();
+						if (options?.signal?.aborted) {
+							emitAbortedTermination(options.signal.reason);
 							return;
 						}
-						const message = resolveAttemptFailureMessage(
-							watchdog,
-							!forwardedAnyEvent
-								? `Provider stream ended before completion event for ${activeProviderId} (credential ${selected.credentialId}) without emitting any events.`
-								: `Provider stream ended before completion event for ${activeProviderId} (credential ${selected.credentialId}).`,
-						);
+						const message = !forwardedAnyEvent
+							? `Provider stream ended before completion event for ${activeProviderId} (credential ${selected.credentialId}) without emitting any events.`
+							: `Provider stream ended before completion event for ${activeProviderId} (credential ${selected.credentialId}).`;
 						const decision = await resolveRetryDecision(
 							message,
 							hasForwardedSubstantiveEvent,
@@ -844,7 +984,7 @@ export function createRotatingStreamWrapper(
 				reason: "error",
 				error: createErrorAssistantMessage(
 					activeModel,
-					`multi-auth rotation failed for ${activeProviderId}: ${getErrorMessage(error)}`,
+					`multi-auth rotation failed for ${activeProviderId}: ${getErrorMessage(error, STRUCTURED_ERROR_MESSAGE_OPTIONS)}`,
 				),
 			};
 			stream.push(assistantError);
@@ -874,7 +1014,6 @@ export async function registerMultiAuthProviders(
 	options?: {
 		excludeProviders?: string[];
 		includeProviders?: string[];
-		streamTimeouts?: StreamTimeoutConfig;
 	},
 ): Promise<void> {
 	const excludeSet = new Set(options?.excludeProviders ?? []);
@@ -967,7 +1106,6 @@ export async function registerMultiAuthProviders(
 			accountManager,
 			baseProvider,
 			baseProvidersByApi,
-			options?.streamTimeouts,
 		);
 		wrappersByApi.set(api, streamSimple);
 		multiAuthDebugLogger.log("stream_wrapper_created", {

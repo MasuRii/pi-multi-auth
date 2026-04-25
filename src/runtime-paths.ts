@@ -1,17 +1,8 @@
-import { homedir } from "node:os";
-import { join, resolve } from "node:path";
-
-function normalizeRuntimeRoot(value: unknown): string | null {
-	if (typeof value !== "string") {
-		return null;
-	}
-
-	const trimmed = value.trim();
-	return trimmed ? resolve(trimmed) : null;
-}
+import { getAgentDir } from "@mariozechner/pi-coding-agent";
+import { join } from "node:path";
 
 export function getAgentRuntimeRoot(): string {
-	return normalizeRuntimeRoot(process.env.PI_CODING_AGENT_DIR) ?? join(homedir(), ".pi", "agent");
+	return getAgentDir();
 }
 
 export function resolveAgentRuntimePath(...segments: string[]): string {

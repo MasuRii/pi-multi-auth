@@ -7,11 +7,13 @@ import {
 	resolveStateHistoryPersistencePaths,
 	type HistoryPersistenceConfig,
 } from "./config.js";
+import { getErrorMessage } from "./auth-error-utils.js";
 import {
 	isRetryableFileAccessError,
 	readTextSnapshotWithRetries,
 	writeTextSnapshotWithRetries,
 } from "./file-retry.js";
+import { cloneJson } from "./json-utils.js";
 import type { CascadeRetryState } from "./types-cascade.js";
 import type { MultiAuthState, ProviderRotationState } from "./types.js";
 import type { HealthMetricsHistory } from "./types-health.js";
@@ -35,10 +37,6 @@ export interface MultiAuthHistoryStoreOptions {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function cloneJson<T>(value: T): T {
-	return JSON.parse(JSON.stringify(value)) as T;
 }
 
 function createEmptyHealthHistorySnapshot(): HealthHistorySnapshot {
@@ -65,7 +63,7 @@ function parseHealthHistorySnapshot(content: string | undefined): HealthHistoryS
 		parsed = JSON.parse(content);
 	} catch (error) {
 		throw new Error(
-			`Invalid JSON in extracted health history snapshot: ${error instanceof Error ? error.message : String(error)}`,
+			`Invalid JSON in extracted health history snapshot: ${getErrorMessage(error)}`,
 		);
 	}
 
@@ -126,7 +124,7 @@ function parseCascadeHistorySnapshot(content: string | undefined): CascadeHistor
 		parsed = JSON.parse(content);
 	} catch (error) {
 		throw new Error(
-			`Invalid JSON in extracted cascade history snapshot: ${error instanceof Error ? error.message : String(error)}`,
+			`Invalid JSON in extracted cascade history snapshot: ${getErrorMessage(error)}`,
 		);
 	}
 

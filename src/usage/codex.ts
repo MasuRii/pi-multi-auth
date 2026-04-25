@@ -1,4 +1,5 @@
 import { request as httpsRequest } from "node:https";
+import { getErrorMessage } from "../auth-error-utils.js";
 import { quotaClassifier } from "../quota-classifier.js";
 import { headersToRecord, rateLimitHeaderParser } from "../rate-limit-headers.js";
 import type {
@@ -185,13 +186,6 @@ function formatPlanType(planType: string | null): string | null {
 		return null;
 	}
 	return PLAN_TYPE_MAP[normalized] ?? planType;
-}
-
-function getErrorMessage(error: unknown): string {
-	if (error instanceof Error) {
-		return error.message;
-	}
-	return String(error);
 }
 
 function isCodexUsageTransportError(error: unknown): boolean {

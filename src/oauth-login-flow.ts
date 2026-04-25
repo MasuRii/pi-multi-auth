@@ -1,4 +1,5 @@
 import { LoginDialogComponent, type ExtensionCommandContext } from "@mariozechner/pi-coding-agent";
+import { getErrorMessage } from "./auth-error-utils.js";
 import type { AccountManager } from "./account-manager.js";
 import type { OAuthLoginCallbacks } from "./oauth-compat.js";
 import type { SupportedProviderId } from "./types.js";
@@ -43,13 +44,6 @@ type OAuthDialogResult =
 		status: "error";
 		message: string;
 	};
-
-function getErrorMessage(error: unknown): string {
-	if (error instanceof Error) {
-		return error.message;
-	}
-	return String(error);
-}
 
 function requireOAuthInput(value: string, message: string): string {
 	if (value.trim()) {

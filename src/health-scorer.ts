@@ -79,11 +79,22 @@ function normalizeHealthConfig(config: Partial<HealthMetricsConfig>): HealthMetr
 }
 
 export class HealthScorer {
-	private readonly config: HealthMetricsConfig;
+	private config: HealthMetricsConfig;
 	private readonly histories = new Map<string, HealthMetricsHistory>();
 	private readonly scores = new Map<string, CredentialHealthScore>();
 
 	constructor(config: Partial<HealthMetricsConfig> = {}) {
+		this.config = normalizeHealthConfig({
+			...DEFAULT_HEALTH_CONFIG,
+			...config,
+			weights: {
+				...DEFAULT_HEALTH_WEIGHTS,
+				...(config.weights ?? {}),
+			},
+		});
+	}
+
+	updateConfig(config: Partial<HealthMetricsConfig>): void {
 		this.config = normalizeHealthConfig({
 			...DEFAULT_HEALTH_CONFIG,
 			...config,

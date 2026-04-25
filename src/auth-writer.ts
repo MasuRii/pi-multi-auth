@@ -1,6 +1,11 @@
 import { constants as fsConstants } from "node:fs";
 import { access, chmod, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
+import {
+	getErrorMessage,
+	isRecord,
+	toError,
+} from "./auth-error-utils.js";
 import type { OAuthCredentials } from "./oauth-compat.js";
 import { resolveAgentRuntimePath } from "./runtime-paths.js";
 import { multiAuthDebugLogger } from "./debug-logger.js";
@@ -52,14 +57,6 @@ type LockOptions = {
 	onCompromised?: (error: Error) => void;
 };
 
-function toError(error: unknown): Error {
-	if (error instanceof Error) {
-		return error;
-	}
-
-	return new Error(String(error));
-}
-
 function sleep(ms: number): Promise<void> {
 	if (ms <= 0) {
 		return Promise.resolve();
@@ -95,8 +92,10 @@ async function acquireFileLock(filePath: string, options: LockOptions): Promise<
 		} catch (error) {
 			const lockError = toError(error);
 			const maybeCode = (lockError as Error & { code?: unknown }).code;
+			const isExistingLockError = maybeCode === "EEXIST";
+			const isRetryableAccessError = isRetryableFileAccessError(lockError);
 
-			if (maybeCode !== "EEXIST") {
+			if (!isExistingLockError && !isRetryableAccessError) {
 				multiAuthDebugLogger.log("auth_lock_error", {
 					authPath: filePath,
 					lockPath,
@@ -105,6 +104,16 @@ async function acquireFileLock(filePath: string, options: LockOptions): Promise<
 					error: lockError.message,
 				});
 				throw lockError;
+			}
+
+			if (!isExistingLockError) {
+				multiAuthDebugLogger.log("auth_lock_retryable_access_error", {
+					authPath: filePath,
+					lockPath,
+					attempt,
+					maxAttempts,
+					error: lockError.message,
+				});
 			}
 
 			try {
@@ -140,8 +149,11 @@ async function acquireFileLock(filePath: string, options: LockOptions): Promise<
 					attempt,
 					maxAttempts,
 					staleMs: options.stale,
+					error: lockError.message,
 				});
-				throw new Error(`Timed out acquiring lock for '${filePath}' after ${maxAttempts} attempt(s).`);
+				throw new Error(
+					`Timed out acquiring lock for '${filePath}' after ${maxAttempts} attempt(s): ${lockError.message}`,
+				);
 			}
 
 			const baseDelay = Math.min(
@@ -196,10 +208,6 @@ function getDefaultAuthPath(): string {
 	return resolveAgentRuntimePath("auth.json");
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 function parseAuthData(content: string | undefined): RawAuthFileData {
 	if (!content || content.trim() === "") {
 		return {};
@@ -209,9 +217,7 @@ function parseAuthData(content: string | undefined): RawAuthFileData {
 	try {
 		parsed = JSON.parse(content);
 	} catch (error) {
-		throw new Error(
-			`Invalid JSON in auth.json: ${error instanceof Error ? error.message : String(error)}`,
-		);
+		throw new Error(`Invalid JSON in auth.json: ${getErrorMessage(error)}`);
 	}
 
 	if (!isRecord(parsed)) {

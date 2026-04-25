@@ -94,4 +94,5 @@ export interface UsageFetchOptions {
 	forceRefresh?: boolean;
 	allowStale?: boolean;
 	maxAgeMs?: number;
+	signal?: AbortSignal;
 }

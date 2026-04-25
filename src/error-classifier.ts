@@ -155,6 +155,19 @@ const REQUEST_TIMEOUT_PATTERNS: RegExp[] = [
 	/request timed out/i,
 ];
 
+/**
+ * Host/runtime initiated cancellations must remain terminal so Pi can stop the request
+ * immediately on user escape/cancel input. Multi-auth only retries its own explicit
+ * watchdog timeouts above, which are normalized into REQUEST_TIMEOUT_PATTERNS.
+ */
+const CANCELLATION_PATTERNS: RegExp[] = [
+	/request was aborted/i,
+	/operation was aborted/i,
+	/\bAbortError\b/i,
+	/\brequest aborted\b/i,
+	/\boperation aborted\b/i,
+];
+
 const TRANSIENT_PROVIDER_PATTERNS: RegExp[] = [
 	/\b5\d\d\b/i,
 	/internal[_\s-]?server[_\s-]?error/i,
@@ -173,9 +186,6 @@ const TRANSIENT_PROVIDER_PATTERNS: RegExp[] = [
 	/socket hang up/i,
 	/network error/i,
 	/fetch failed/i,
-	/request was aborted/i,
-	/operation was aborted/i,
-	/\bAbortError\b/i,
 	/ended (?:before|without) completion/i,
 	/without completion event/i,
 	/stream ended unexpectedly/i,
@@ -357,6 +367,17 @@ export function classifyCredentialError(
 				? "Quota or spend exhaustion pattern detected"
 				: "Rate-limit pattern detected",
 		});
+	}
+
+	if (matchesAny(message, CANCELLATION_PATTERNS)) {
+		return {
+			kind: "unknown",
+			shouldRotateCredential: false,
+			shouldRetrySameCredential: false,
+			shouldApplyCooldown: false,
+			shouldDisableCredential: false,
+			reason: "Cancellation or abort detected; preserving caller-owned termination semantics",
+		};
 	}
 
 	if (matchesAny(message, REQUEST_TIMEOUT_PATTERNS)) {

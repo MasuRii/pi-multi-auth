@@ -1,3 +1,4 @@
+import { getErrorMessage } from "../auth-error-utils.js";
 import { usageProviders } from "./providers.js";
 import type {
 	UsageAuth,
@@ -22,13 +23,6 @@ interface UsageCacheEntry {
 interface ResolvedUsageCacheRead {
 	result: UsageFetchResult;
 	isStale: boolean;
-}
-
-function getErrorMessage(error: unknown): string {
-	if (error instanceof Error) {
-		return error.message;
-	}
-	return String(error);
 }
 
 function cacheKey(providerId: string, credentialId: string): string {

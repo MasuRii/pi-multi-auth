@@ -95,5 +95,13 @@ export interface GlobalKeyDistributor {
 	getLeaseForSession?(
 		sessionId: string,
 	): Promise<{ credentialId: string; apiKey: string } | null> | { credentialId: string; apiKey: string } | null;
+	shouldBypassDelegatedSubagentAcquisition?(
+		providerId: SupportedProviderId,
+		options?: { modelId?: string; signal?: AbortSignal },
+	): Promise<boolean> | boolean;
+	releaseLightweightSessionLeases?(
+		parentSessionId: string,
+		providerId?: SupportedProviderId,
+	): void;
 	getMetrics?(): KeyDistributorMetrics;
 }

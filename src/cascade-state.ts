@@ -28,10 +28,17 @@ function cloneProviderCascadeState(state: ProviderCascadeState): ProviderCascade
 }
 
 export class CascadeStateManager {
-	private readonly config: CascadeConfig;
+	private config: CascadeConfig;
 	private readonly cascadeStates = new Map<string, ProviderCascadeState>();
 
 	constructor(config: Partial<CascadeConfig> = {}) {
+		this.config = {
+			...DEFAULT_CASCADE_CONFIG,
+			...config,
+		};
+	}
+
+	updateConfig(config: Partial<CascadeConfig>): void {
 		this.config = {
 			...DEFAULT_CASCADE_CONFIG,
 			...config,

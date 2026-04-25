@@ -1,7 +1,18 @@
 import type { Api } from "@mariozechner/pi-ai";
+import {
+	formatOAuthProviderLabel,
+	formatOAuthRefreshFailureSummary,
+	getErrorMessage,
+	inferOAuthRefreshFailureMetadata,
+	isRecord,
+	normalizeStructuredAuthField,
+	raceWithSignal,
+	throwIfAborted,
+} from "./auth-error-utils.js";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "./oauth-compat.js";
 import { getOAuthProvider, refreshOAuthCredential } from "./oauth-compat.js";
 import { CascadeStateManager } from "./cascade-state.js";
+import { CLINE_REFRESH_LEAD_TIME_MS } from "./cline-compat.js";
 import { FailoverChainManager } from "./failover-chain.js";
 import { HealthScorer } from "./health-scorer.js";
 import {
@@ -10,6 +21,7 @@ import {
 } from "./oauth-refresh-scheduler.js";
 import { PoolManager } from "./pool-manager.js";
 import { quotaClassifier } from "./quota-classifier.js";
+import { getRoundRobinCandidateIndex, getUsageBasedCandidateIndex } from "./rotation-selection.js";
 import {
 	AuthWriter,
 	type ApiKeyProviderNormalizationResult,
@@ -44,7 +56,10 @@ import { usageProviders } from "./usage/providers.js";
 import type { UsageFetchOptions, UsageSnapshot } from "./usage/types.js";
 import {
 	formatCredentialRedaction,
+	getCredentialExpiration,
+	getCredentialRequestSecret,
 	getCredentialSecret,
+	isExpiredApiKeyCredential,
 	validateApiKeyInput,
 } from "./credential-display.js";
 import {
@@ -57,6 +72,7 @@ import {
 	KeyDistributor,
 	registerGlobalKeyDistributor,
 } from "./balancer/index.js";
+import { LightweightRotationState } from "./lightweight-rotation-state.js";
 import {
 	computeExponentialBackoffMs,
 	getWeeklyQuotaCooldownMs,
@@ -71,6 +87,7 @@ import {
 } from "./config.js";
 import { multiAuthDebugLogger } from "./debug-logger.js";
 import type { CredentialErrorKind } from "./error-classifier.js";
+import { haveSameJsonValue } from "./json-utils.js";
 import { extractCodexCredentialIdentity } from "./openai-codex-identity.js";
 import type { ChainResult, FailoverChain, FailoverChainState } from "./types-failover.js";
 import {
@@ -83,6 +100,10 @@ import type { QuotaClassification, QuotaClassificationResult, QuotaStateForCrede
 
 const QUOTA_COOLDOWN_MS = 60 * 60 * 1000;
 const OAUTH_REFRESH_FAILURE_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+const PRESERVED_OAUTH_REFRESH_MIN_REMAINING_MS = 30_000;
+const PRESERVED_OAUTH_REFRESH_ERROR_CODES_BY_PROVIDER = new Map<string, ReadonlySet<string>>([
+	["cline", new Set(["failed_to_refresh_token"])],
+]);
 
 const MIN_QUOTA_RETRY_WINDOW_MS = 60_000;
 const SELECTION_USAGE_MAX_AGE_MS = 15_000;
@@ -97,10 +118,18 @@ interface AccountManagerRuntimeOptions {
 	startOAuthRefreshScheduler?: boolean;
 }
 
+export type CredentialRefreshDisposition = "refreshed" | "preserved_active_token";
+
+export interface CredentialRefreshResult {
+	credential: StoredOAuthCredential;
+	disposition: CredentialRefreshDisposition;
+}
+
 export interface ProviderRefreshResult {
 	provider: SupportedProviderId;
 	totalCredentials: number;
 	refreshedCredentialIds: string[];
+	preservedCredentialIds: string[];
 	failedCredentials: Array<{ credentialId: string; error: string }>;
 	usageWarnings: Array<{ credentialId: string; warning: string }>;
 }
@@ -131,6 +160,7 @@ interface CredentialUsageContext {
 	credentialIds: readonly string[];
 	credentialsByIdPromise?: Promise<Map<string, StoredAuthCredential>>;
 	selectionCache: CredentialSelectionCache;
+	signal?: AbortSignal;
 }
 
 export function createCredentialSelectionCache(): CredentialSelectionCache {
@@ -174,6 +204,7 @@ type AcquireCredentialOptions = {
 	excludedCredentialIds?: Set<string>;
 	modelId?: string;
 	selectionCache?: CredentialSelectionCache;
+	signal?: AbortSignal;
 };
 
 export interface ResolvedFailoverTarget extends ChainResult {
@@ -218,22 +249,61 @@ function buildCodexIdentityKey(
 	return `credential:${credentialId}`;
 }
 
+function buildClineIdentityKey(credential: OAuthCredentials): string | undefined {
+	const accountId = normalizeStructuredAuthField(
+		typeof credential.accountId === "string" ? credential.accountId : undefined,
+	);
+	if (accountId) {
+		return `account:${accountId}`;
+	}
+
+	const userInfo = isRecord(credential.userInfo) ? credential.userInfo : undefined;
+	const userInfoId = normalizeStructuredAuthField(
+		typeof userInfo?.id === "string" ? userInfo.id : undefined,
+	);
+	if (userInfoId) {
+		return `account:${userInfoId}`;
+	}
+
+	const email =
+		normalizeStructuredAuthField(
+			typeof userInfo?.email === "string" ? userInfo.email : undefined,
+		) ??
+		normalizeStructuredAuthField(
+			typeof credential.email === "string" ? credential.email : undefined,
+		);
+	return email ? `email:${email.toLowerCase()}` : undefined;
+}
+
 function inferCredentialFriendlyName(
 	provider: SupportedProviderId,
 	credentialId: string,
 	credential: StoredOAuthCredential,
 ): string | undefined {
-	if (provider !== "openai-codex") {
-		return undefined;
+	if (provider === "openai-codex") {
+		const identity = extractCodexCredentialIdentity(credential);
+		const candidate = identity.email ?? identity.accountUserId;
+		if (!candidate || candidate === credentialId) {
+			return undefined;
+		}
+		return candidate;
 	}
 
-	const identity = extractCodexCredentialIdentity(credential);
-	const candidate = identity.email ?? identity.accountUserId;
-	if (!candidate || candidate === credentialId) {
-		return undefined;
+	if (provider === "cline") {
+		const userInfo =
+			typeof credential.userInfo === "object" && credential.userInfo !== null
+				? (credential.userInfo as Record<string, unknown>)
+				: undefined;
+		const email = typeof userInfo?.email === "string" ? userInfo.email.trim() : "";
+		const displayName = typeof userInfo?.displayName === "string" ? userInfo.displayName.trim() : "";
+		const candidate = email || displayName;
+		if (!candidate || candidate === credentialId) {
+			return undefined;
+		}
+		return candidate;
 	}
 
-	return candidate;
+	return undefined;
 }
 
 function toEpochMs(timestamp: number | null | undefined): number | null {
@@ -654,6 +724,26 @@ function normalizeProviderState(state: ProviderRotationState): void {
 		state.friendlyNames[key] = normalized;
 	}
 
+	for (const key of Object.keys(state.disabledCredentials)) {
+		if (!validIds.has(key)) {
+			delete state.disabledCredentials[key];
+			continue;
+		}
+		const entry = state.disabledCredentials[key];
+		const normalizedError = entry?.error?.trim();
+		if (!normalizedError) {
+			delete state.disabledCredentials[key];
+			continue;
+		}
+		state.disabledCredentials[key] = {
+			error: normalizedError,
+			disabledAt:
+				typeof entry.disabledAt === "number" && Number.isFinite(entry.disabledAt)
+					? entry.disabledAt
+					: Date.now(),
+		};
+	}
+
 	keepOnlyValidNumericKeys(state.oauthRefreshScheduled ?? {});
 
 	if (state.cascadeState) {
@@ -805,54 +895,6 @@ function normalizeProviderState(state: ProviderRotationState): void {
 	}
 }
 
-function getRoundRobinCandidateIndex(
-	state: ProviderRotationState,
-	available: Set<string>,
-): number | undefined {
-	if (state.credentialIds.length === 0) {
-		return undefined;
-	}
-
-	for (let offset = 0; offset < state.credentialIds.length; offset += 1) {
-		const index = (state.activeIndex + offset) % state.credentialIds.length;
-		const credentialId = state.credentialIds[index];
-		if (available.has(credentialId)) {
-			return index;
-		}
-	}
-
-	return undefined;
-}
-
-function getUsageBasedCandidateIndex(
-	state: ProviderRotationState,
-	available: Set<string>,
-): number | undefined {
-	const candidates = state.credentialIds
-		.map((credentialId, index) => ({
-			credentialId,
-			index,
-			usageCount: state.usageCount[credentialId] ?? 0,
-			quotaErrorCount: state.quotaErrorCount[credentialId] ?? 0,
-			lastUsedAt: state.lastUsedAt[credentialId] ?? 0,
-		}))
-		.filter((item) => available.has(item.credentialId))
-		.sort((left, right) => {
-			if (left.quotaErrorCount !== right.quotaErrorCount) {
-				return left.quotaErrorCount - right.quotaErrorCount;
-			}
-			if (left.usageCount !== right.usageCount) {
-				return left.usageCount - right.usageCount;
-			}
-			if (left.lastUsedAt !== right.lastUsedAt) {
-				return left.lastUsedAt - right.lastUsedAt;
-			}
-			return left.index - right.index;
-		});
-
-	return candidates[0]?.index;
-}
-
 function buildAvailableSet(
 	state: ProviderRotationState,
 	now: number,
@@ -981,17 +1023,178 @@ function clearRecoveredCodexRefreshFailureState(
 	return changed;
 }
 
+function getEffectiveOAuthCredentialExpiration(
+	credential: StoredOAuthCredential,
+): number {
+	return determineTokenExpiration(credential.access, credential.expires).expiresAt;
+}
+
+function getOAuthRefreshLeadTimeMs(provider: SupportedProviderId, defaultSafetyWindowMs: number): number {
+	return provider === "cline"
+		? Math.max(defaultSafetyWindowMs, CLINE_REFRESH_LEAD_TIME_MS)
+		: defaultSafetyWindowMs;
+}
+
+function getSchedulerExpirationForRefreshLeadTime(
+	provider: SupportedProviderId,
+	expiresAt: number,
+	schedulerSafetyWindowMs: number,
+): number {
+	const leadTimeMs = getOAuthRefreshLeadTimeMs(provider, schedulerSafetyWindowMs);
+	return expiresAt - Math.max(0, leadTimeMs - schedulerSafetyWindowMs);
+}
+
+function hasPreservableOAuthTokenLifetime(
+	credential: StoredOAuthCredential,
+	now: number = Date.now(),
+): boolean {
+	return getEffectiveOAuthCredentialExpiration(credential) - now > PRESERVED_OAUTH_REFRESH_MIN_REMAINING_MS;
+}
+
+function isRecoverableClineOAuthRefreshFailureMessage(message: string | undefined): boolean {
+	const normalizedMessage = message?.trim();
+	if (!normalizedMessage) {
+		return false;
+	}
+
+	return (
+		/cline refresh rejected permanently/i.test(normalizedMessage) &&
+		/code=failed[_\s-]*to[_\s-]*refresh[_\s-]*token/i.test(normalizedMessage)
+	);
+}
+
+function clearRecoveredClineRefreshFailureState(
+	state: ProviderRotationState,
+	credentialId: string,
+	_credential: StoredOAuthCredential,
+	_now: number = Date.now(),
+): boolean {
+	const disabledEntry = state.disabledCredentials?.[credentialId];
+	if (!disabledEntry || !isRecoverableClineOAuthRefreshFailureMessage(disabledEntry.error)) {
+		return false;
+	}
+
+	delete state.disabledCredentials[credentialId];
+	if (Object.keys(state.disabledCredentials).length === 0) {
+		state.disabledCredentials = {};
+	}
+	return true;
+}
+
+function shouldPreserveActiveOAuthCredentialAfterRefreshFailure(
+	provider: SupportedProviderId,
+	credential: StoredOAuthCredential,
+	failure: OAuthRefreshFailureError,
+	now: number = Date.now(),
+): boolean {
+	if (!hasPreservableOAuthTokenLifetime(credential, now)) {
+		return false;
+	}
+
+	if (provider === "cline" && failure.details.permanent) {
+		return true;
+	}
+
+	const errorCode = normalizeStructuredAuthField(failure.details.errorCode);
+	if (!errorCode) {
+		return false;
+	}
+
+	return PRESERVED_OAUTH_REFRESH_ERROR_CODES_BY_PROVIDER.get(provider)?.has(errorCode) ?? false;
+}
+
+function isDisabledByPreservableOAuthRefreshFailure(
+	provider: SupportedProviderId,
+	errorMessage: string | undefined,
+): boolean {
+	const normalizedMessage = errorMessage?.trim();
+	if (!normalizedMessage) {
+		return false;
+	}
+	if (provider === "cline" && isRecoverableClineOAuthRefreshFailureMessage(normalizedMessage)) {
+		return true;
+	}
+
+	const inferredFailure = inferOAuthRefreshFailureMetadata(normalizedMessage);
+	const errorCode = normalizeStructuredAuthField(inferredFailure.errorCode);
+	if (!errorCode) {
+		return false;
+	}
+
+	return PRESERVED_OAUTH_REFRESH_ERROR_CODES_BY_PROVIDER.get(provider)?.has(errorCode) ?? false;
+}
+
+function clearDisabledOAuthRefreshFailureStateForProvider(
+	provider: SupportedProviderId,
+	state: ProviderRotationState,
+): boolean {
+	let changed = false;
+	for (const [credentialId, entry] of Object.entries(state.disabledCredentials ?? {})) {
+		if (!isDisabledByPreservableOAuthRefreshFailure(provider, entry?.error)) {
+			continue;
+		}
+		delete state.disabledCredentials[credentialId];
+		changed = true;
+	}
+
+	if (changed && Object.keys(state.disabledCredentials).length === 0) {
+		state.disabledCredentials = {};
+	}
+
+	return changed;
+}
+
+function clearRecoveredOAuthRefreshFailureStateForCredential(
+	provider: SupportedProviderId,
+	state: ProviderRotationState,
+	credentialId: string,
+	credential: StoredOAuthCredential,
+	now: number = Date.now(),
+): boolean {
+	if (provider === "openai-codex") {
+		return clearRecoveredCodexRefreshFailureState(state, credentialId);
+	}
+	if (provider === "cline") {
+		return clearRecoveredClineRefreshFailureState(state, credentialId, credential, now);
+	}
+	return false;
+}
+
+function clearRecoveredOAuthRefreshFailureStateForProvider(
+	provider: SupportedProviderId,
+	state: ProviderRotationState,
+	credentialEntries: readonly AuthCredentialEntry[],
+	now: number = Date.now(),
+): boolean {
+	let changed = false;
+	for (const entry of credentialEntries) {
+		if (entry.credential.type !== "oauth") {
+			continue;
+		}
+		changed =
+			clearRecoveredOAuthRefreshFailureStateForCredential(
+				provider,
+				state,
+				entry.credentialId,
+				entry.credential,
+				now,
+			) || changed;
+	}
+	return changed;
+}
+
 /**
  * Manages multi-account credentials and rotation behavior across providers.
  */
 export class AccountManager {
 	private readonly keyDistributor: KeyDistributor;
-	private readonly extensionConfig: MultiAuthExtensionConfig;
+	private extensionConfig: MultiAuthExtensionConfig;
 	private readonly cascadeStateManager: CascadeStateManager;
 	private readonly healthScorer: HealthScorer;
 	private readonly oauthRefreshScheduler: OAuthRefreshScheduler;
 	private readonly runtimeOptions: Readonly<Required<AccountManagerRuntimeOptions>>;
 	private readonly oauthRefreshInFlight = new Map<string, Promise<StoredOAuthCredential>>();
+	private readonly lightweightRotationState: LightweightRotationState;
 	private readonly authWriter: AuthWriter;
 	private readonly storage: MultiAuthStorage;
 	private readonly usageService: UsageService;
@@ -1017,6 +1220,7 @@ export class AccountManager {
 			});
 		this.usageService = usageService;
 		this.providerRegistry = providerRegistry;
+		this.lightweightRotationState = new LightweightRotationState(this.storage);
 		this.runtimeOptions = {
 			startOAuthRefreshScheduler: runtimeOptions.startOAuthRefreshScheduler !== false,
 		};
@@ -1028,8 +1232,12 @@ export class AccountManager {
 			globalKeyDistributor ??
 			new KeyDistributor(this.storage, this.authWriter);
 		registerGlobalKeyDistributor(this.keyDistributor);
-		this.keyDistributor.setModelEligibilityResolver((providerId, credentialIds, modelId) =>
-			this.resolveCredentialModelEligibility(providerId, credentialIds, modelId),
+		this.keyDistributor.setProviderCapabilitiesResolver((providerId) =>
+			this.providerRegistry.getProviderCapabilities(providerId),
+		);
+		this.keyDistributor.setLightweightRotationState(this.lightweightRotationState);
+		this.keyDistributor.setModelEligibilityResolver((providerId, credentialIds, modelId, signal) =>
+			this.resolveCredentialModelEligibility(providerId, credentialIds, modelId, undefined, signal),
 		);
 		this.oauthRefreshScheduler = new OAuthRefreshScheduler(
 			async (credentialId, providerId) => this.refreshScheduledOAuthCredential(providerId, credentialId),
@@ -1054,8 +1262,37 @@ export class AccountManager {
 		return this.providerRegistry;
 	}
 
+	private isOAuthRefreshManagedForProvider(provider: SupportedProviderId): boolean {
+		return (
+			this.extensionConfig.oauthRefresh.enabled &&
+			!this.extensionConfig.oauthRefresh.excludedProviders.includes(provider)
+		);
+	}
+
+	private assertOAuthRefreshManagedForProvider(provider: SupportedProviderId): void {
+		if (this.isOAuthRefreshManagedForProvider(provider)) {
+			return;
+		}
+		if (!this.extensionConfig.oauthRefresh.enabled) {
+			throw new Error("OAuth token refresh is globally disabled in pi-multi-auth configuration.");
+		}
+		throw new Error(`OAuth token refresh is explicitly disabled for provider ${provider}.`);
+	}
+
 	shutdown(): void {
 		this.oauthRefreshScheduler.stop();
+		this.lightweightRotationState.shutdown();
+	}
+
+	/**
+	 * Refreshes extension configuration on reload.
+	 * Updates internal config and propagates changes to stateful components.
+	 */
+	refreshExtensionConfig(config: MultiAuthExtensionConfig): void {
+		this.extensionConfig = cloneMultiAuthExtensionConfig(config);
+		this.cascadeStateManager.updateConfig(this.extensionConfig.cascade);
+		this.healthScorer.updateConfig(this.extensionConfig.health);
+		this.oauthRefreshScheduler.updateConfig(this.extensionConfig.oauthRefresh);
 	}
 
 	/**
@@ -1067,10 +1304,26 @@ export class AccountManager {
 	}
 
 	/**
+	 * Returns the normalized credential IDs currently associated with one provider.
+	 */
+	async listProviderCredentialIds(provider: SupportedProviderId): Promise<readonly string[]> {
+		const state = await this.syncProviderState(provider);
+		return [...state.credentialIds];
+	}
+
+	/**
 	 * Returns capability flags for one provider.
 	 */
 	getProviderCapabilities(provider: SupportedProviderId): ProviderCapabilities {
 		return this.providerRegistry.getProviderCapabilities(provider);
+	}
+
+	async flushLightweightRotationState(provider?: SupportedProviderId): Promise<void> {
+		if (provider) {
+			await this.lightweightRotationState.flushProvider(provider);
+			return;
+		}
+		await this.lightweightRotationState.flushAll();
 	}
 
 	/**
@@ -1085,6 +1338,68 @@ export class AccountManager {
 	 */
 	getStoragePath(): string {
 		return this.storage.getPath();
+	}
+
+	private isLightweightRotationProvider(provider: SupportedProviderId): boolean {
+		return this.getProviderCapabilities(provider).rotationProfile === "lightweight";
+	}
+
+	private applyLightweightRotationState(
+		provider: SupportedProviderId,
+		state: ProviderRotationState,
+	): ProviderRotationState {
+		if (!this.isLightweightRotationProvider(provider)) {
+			return state;
+		}
+		return this.lightweightRotationState.applyToProviderState(provider, state);
+	}
+
+	private async flushLightweightRotationStateIfNeeded(
+		provider: SupportedProviderId,
+	): Promise<void> {
+		if (!this.isLightweightRotationProvider(provider)) {
+			return;
+		}
+		await this.lightweightRotationState.flushProvider(provider);
+	}
+
+	private recordLightweightSelection(
+		provider: SupportedProviderId,
+		state: ProviderRotationState,
+		credentialId: string,
+		selectedIndex: number,
+		nextActiveIndex: number,
+		selectedAt: number,
+		poolState?: ProviderPoolState,
+		incrementUsage: boolean = true,
+	): void {
+		if (!this.isLightweightRotationProvider(provider)) {
+			return;
+		}
+		this.lightweightRotationState.recordSelection({
+			providerId: provider,
+			credentialIds: state.credentialIds,
+			credentialId,
+			selectedIndex,
+			nextActiveIndex,
+			selectedAt,
+			poolState,
+			incrementUsage,
+		});
+	}
+
+	private recordLightweightTelemetry(provider: SupportedProviderId, credentialIds: readonly string[]): void {
+		if (!this.isLightweightRotationProvider(provider)) {
+			return;
+		}
+		this.lightweightRotationState.recordTelemetry({
+			providerId: provider,
+			credentialIds,
+			cascadeState: {
+				[provider]: this.cascadeStateManager.getProviderState(provider),
+			},
+			healthState: this.healthScorer.exportState(credentialIds),
+		});
 	}
 
 	/**
@@ -1130,10 +1445,12 @@ export class AccountManager {
 	private createCredentialUsageContext(
 		credentialIds: readonly string[],
 		selectionCache: CredentialSelectionCache,
+		signal?: AbortSignal,
 	): CredentialUsageContext {
 		return {
 			credentialIds,
 			selectionCache,
+			signal,
 		};
 	}
 
@@ -1195,7 +1512,11 @@ export class AccountManager {
 			};
 		}
 
-		const credential = await this.resolveCredentialForUsage(credentialId, context);
+		const credential = await raceWithSignal(
+			this.resolveCredentialForUsage(credentialId, context),
+			context?.signal,
+			`Credential usage lookup aborted for ${provider}/${credentialId}.`,
+		);
 		if (!credential) {
 			return {
 				snapshot: null,
@@ -1207,9 +1528,17 @@ export class AccountManager {
 		let freshCredential: StoredAuthCredential = credential;
 		if (credential.type === "oauth") {
 			try {
-				freshCredential = await this.refreshIfNeeded(provider, credentialId, credential);
+				freshCredential = await this.refreshIfNeeded(
+					provider,
+					credentialId,
+					credential,
+					context?.signal,
+				);
 			} catch (error: unknown) {
-				const message = error instanceof Error ? error.message : String(error);
+				if (error instanceof Error && error.name === "AbortError") {
+					throw error;
+				}
+				const message = getErrorMessage(error);
 				return {
 					snapshot: null,
 					error: `Usage unavailable (token refresh failed: ${message})`,
@@ -1231,15 +1560,19 @@ export class AccountManager {
 				? freshCredential.accountId
 				: undefined;
 
-		const usage = await this.usageService.fetchUsage(
-			provider,
-			credentialId,
-			{
-				accessToken: getCredentialSecret(freshCredential),
-				accountId,
-				credential: { ...freshCredential },
-			},
-			options,
+		const usage = await raceWithSignal(
+			this.usageService.fetchUsage(
+				provider,
+				credentialId,
+				{
+					accessToken: getCredentialSecret(freshCredential),
+					accountId,
+					credential: { ...freshCredential },
+				},
+				options,
+			),
+			context?.signal ?? options?.signal,
+			`Usage fetch aborted for ${provider}/${credentialId}.`,
 		);
 		if (!usage.fromCache) {
 			await this.reconcileQuotaStateFromUsage(provider, credentialId, usage.snapshot);
@@ -1325,6 +1658,28 @@ export class AccountManager {
 		}
 
 		const credentials = await oauthProvider.login(callbacks);
+		const duplicateCredentialId = await this.findExistingOAuthCredentialIdByIdentity(
+			provider,
+			credentials,
+		);
+		if (duplicateCredentialId) {
+			await this.authWriter.setOAuthCredential(duplicateCredentialId, credentials);
+			const credentialIds = await this.authWriter.listProviderCredentialIds(provider);
+			await this.persistCredentialList(provider, credentialIds, duplicateCredentialId, {
+				type: "oauth",
+				...credentials,
+			});
+			this.usageService.clearProvider(provider);
+			return {
+				credentialId: duplicateCredentialId,
+				isBackupCredential: duplicateCredentialId !== provider,
+				credentialIds: this.deduplicateCredentialEntries(
+					provider,
+					await this.authWriter.getProviderCredentialEntries(provider),
+				),
+			};
+		}
+
 		const backupResult = await this.authWriter.setOAuthCredentialAsBackup(provider, credentials);
 		await this.persistCredentialList(provider, backupResult.credentialIds, backupResult.credentialId, {
 			type: "oauth",
@@ -1333,6 +1688,31 @@ export class AccountManager {
 		this.usageService.clearProvider(provider);
 
 		return backupResult;
+	}
+
+	private async findExistingOAuthCredentialIdByIdentity(
+		provider: SupportedProviderId,
+		credentials: OAuthCredentials,
+	): Promise<string | undefined> {
+		if (provider !== "cline") {
+			return undefined;
+		}
+
+		const identityKey = buildClineIdentityKey(credentials);
+		if (!identityKey) {
+			return undefined;
+		}
+
+		const entries = await this.authWriter.getProviderCredentialEntries(provider);
+		for (const entry of entries) {
+			if (entry.credential.type !== "oauth") {
+				continue;
+			}
+			if (buildClineIdentityKey(entry.credential) === identityKey) {
+				return entry.credentialId;
+			}
+		}
+		return undefined;
 	}
 
 	/**
@@ -1362,6 +1742,7 @@ export class AccountManager {
 		lastAddedCredentialId: string,
 		persistedCredential?: StoredAuthCredential,
 	): Promise<void> {
+		await this.flushLightweightRotationStateIfNeeded(provider);
 		await this.storage.withLock((state) => {
 			const providerState = getProviderState(state, provider);
 			providerState.credentialIds = [...credentialIds];
@@ -1393,6 +1774,8 @@ export class AccountManager {
 			throw new Error("Credential index must be a non-negative integer");
 		}
 
+		await this.flushLightweightRotationStateIfNeeded(provider);
+
 		const syncedState = await this.syncProviderState(provider);
 		if (index >= syncedState.credentialIds.length) {
 			throw new Error(
@@ -1421,6 +1804,7 @@ export class AccountManager {
 	 * Clears manual active account selection and returns to extension-managed rotation.
 	 */
 	async clearManualActiveCredential(provider: SupportedProviderId): Promise<void> {
+		await this.flushLightweightRotationStateIfNeeded(provider);
 		await this.storage.withLock((state) => {
 			const providerState = getProviderState(state, provider);
 			providerState.manualActiveCredentialId = undefined;
@@ -1435,6 +1819,7 @@ export class AccountManager {
 		provider: SupportedProviderId,
 		credentialIds: readonly string[],
 	): Promise<void> {
+		await this.flushLightweightRotationStateIfNeeded(provider);
 		const normalizedCredentialIds = normalizeCredentialIdsForDeletion(credentialIds);
 		const state = await this.syncProviderState(provider);
 		const availableCredentialIds = new Set(state.credentialIds);
@@ -1532,8 +1917,16 @@ export class AccountManager {
 		error: unknown,
 	): OAuthRefreshFailureError {
 		if (isOAuthRefreshFailureError(error)) {
+			const summary = formatOAuthRefreshFailureSummary({
+				providerLabel: formatOAuthProviderLabel(error.details.providerId || provider),
+				status: error.details.status,
+				errorCode: error.details.errorCode,
+				reason: error.details.reason,
+				permanent: error.details.permanent,
+				source: error.details.source,
+			});
 			return new OAuthRefreshFailureError(
-				`Failed to refresh OAuth token for ${credentialId}: ${error.message}`,
+				`Failed to refresh OAuth token for ${credentialId}: ${summary}`,
 				{
 					...error.details,
 					credentialId,
@@ -1542,13 +1935,22 @@ export class AccountManager {
 			);
 		}
 
-		const message = error instanceof Error ? error.message : String(error);
+		const inferredMetadata = inferOAuthRefreshFailureMetadata(getErrorMessage(error));
+		const summary = formatOAuthRefreshFailureSummary({
+			providerLabel: formatOAuthProviderLabel(provider),
+			errorCode: inferredMetadata.errorCode,
+			reason: inferredMetadata.reason,
+			permanent: inferredMetadata.permanent,
+			source: "provider",
+		});
 		return new OAuthRefreshFailureError(
-			`Failed to refresh OAuth token for ${credentialId}: ${message}`,
+			`Failed to refresh OAuth token for ${credentialId}: ${summary}`,
 			{
 				providerId: provider,
 				credentialId,
-				permanent: false,
+				errorCode: inferredMetadata.errorCode,
+				reason: inferredMetadata.reason,
+				permanent: inferredMetadata.permanent ?? false,
 				source: "provider",
 			},
 			{ cause: error },
@@ -1558,8 +1960,9 @@ export class AccountManager {
 	private async clearRecoveredOAuthRefreshFailureState(
 		provider: SupportedProviderId,
 		credentialId: string,
+		credential: StoredOAuthCredential,
 	): Promise<void> {
-		if (provider !== "openai-codex") {
+		if (provider !== "openai-codex" && provider !== "cline") {
 			return;
 		}
 
@@ -1569,7 +1972,12 @@ export class AccountManager {
 				return { result: false };
 			}
 
-			const changed = clearRecoveredCodexRefreshFailureState(providerState, credentialId);
+			const changed = clearRecoveredOAuthRefreshFailureStateForCredential(
+				provider,
+				providerState,
+				credentialId,
+				credential,
+			);
 			if (!changed) {
 				return { result: false };
 			}
@@ -1608,7 +2016,7 @@ export class AccountManager {
 			return null;
 		}
 
-		await this.clearRecoveredOAuthRefreshFailureState(provider, credentialId);
+		await this.clearRecoveredOAuthRefreshFailureState(provider, credentialId, currentCredential);
 		multiAuthDebugLogger.log("oauth_refresh_reuse_recovered", {
 			provider,
 			credentialId,
@@ -1623,6 +2031,7 @@ export class AccountManager {
 	private async logAndHandleOAuthRefreshFailure(
 		provider: SupportedProviderId,
 		credentialId: string,
+		credential: StoredOAuthCredential,
 		error: unknown,
 	): Promise<OAuthRefreshFailureError> {
 		const failure = this.createOAuthRefreshFailure(provider, credentialId, error);
@@ -1634,8 +2043,7 @@ export class AccountManager {
 			source: failure.details.source,
 			status: failure.details.status,
 			errorCode: failure.details.errorCode,
-			errorDescription: failure.details.errorDescription,
-			responseBody: failure.details.responseBody,
+			reason: failure.details.reason,
 		});
 
 		if (failure.details.errorCode === UNSUPPORTED_OAUTH_REFRESH_PROVIDER_ERROR_CODE) {
@@ -1652,6 +2060,31 @@ export class AccountManager {
 		}
 
 		if (failure.details.permanent) {
+			const now = Date.now();
+			if (
+				shouldPreserveActiveOAuthCredentialAfterRefreshFailure(
+					provider,
+					credential,
+					failure,
+					now,
+				)
+			) {
+				await this.clearRecoveredOAuthRefreshFailureState(provider, credentialId, credential);
+				this.oauthRefreshScheduler.cancelRefresh(credentialId);
+				await this.persistOAuthRefreshSchedule(provider);
+				multiAuthDebugLogger.log("oauth_refresh_active_token_preserved", {
+					provider,
+					credentialId,
+					message: failure.message,
+					status: failure.details.status,
+					errorCode: failure.details.errorCode,
+					reason: failure.details.reason,
+					expiresAt: credential.expires,
+					remainingMs: Math.max(0, credential.expires - now),
+				});
+				return failure;
+			}
+
 			// For OpenAI Codex, we don't auto-disable credentials on OAuth refresh failures.
 			// Instead, we set a long cooldown (24 hours) so the user can manually re-login
 			// and refresh the token without losing the credential configuration.
@@ -1738,9 +2171,11 @@ export class AccountManager {
 		const credentialsById = await this.authWriter.getCredentials([credentialId]);
 		const credential = credentialsById.get(credentialId);
 		if (credential?.type === "oauth") {
-			const refreshed = await this.refreshCredentialToken(provider, credentialId, credential);
-			this.scheduleOAuthRefresh(provider, credentialId, refreshed);
-			await this.persistOAuthRefreshSchedule(provider);
+			const refreshResult = await this.refreshCredential(provider, credentialId);
+			if (refreshResult.disposition === "refreshed") {
+				this.scheduleOAuthRefresh(provider, credentialId, refreshResult.credential);
+				await this.persistOAuthRefreshSchedule(provider);
+			}
 		}
 
 		this.usageService.clearCredential(provider, credentialId);
@@ -1752,7 +2187,7 @@ export class AccountManager {
 	async refreshCredential(
 		provider: SupportedProviderId,
 		credentialId: string,
-	): Promise<StoredOAuthCredential> {
+	): Promise<CredentialRefreshResult> {
 		const state = await this.syncProviderState(provider);
 		if (!state.credentialIds.includes(credentialId)) {
 			throw new Error(`Credential ${credentialId} is not available for provider ${provider}`);
@@ -1767,18 +2202,40 @@ export class AccountManager {
 				`Credential ${credentialId} is an API key and does not support OAuth token refresh.`,
 			);
 		}
+		this.assertOAuthRefreshManagedForProvider(provider);
 
-		const refreshed = await this.refreshCredentialToken(provider, credentialId, credential);
-		this.scheduleOAuthRefresh(provider, credentialId, refreshed);
+		let effectiveCredential: StoredOAuthCredential;
+		let disposition: CredentialRefreshDisposition = "refreshed";
+		let shouldPersistRefreshSchedule = true;
+		try {
+			effectiveCredential = await this.refreshCredentialToken(provider, credentialId, credential);
+			this.scheduleOAuthRefresh(provider, credentialId, effectiveCredential);
+		} catch (error) {
+			if (
+				isOAuthRefreshFailureError(error) &&
+				shouldPreserveActiveOAuthCredentialAfterRefreshFailure(provider, credential, error)
+			) {
+				effectiveCredential = credential;
+				disposition = "preserved_active_token";
+				shouldPersistRefreshSchedule = false;
+			} else {
+				throw error;
+			}
+		}
 		await this.storage.withLock((stored) => {
 			const providerState = getProviderState(stored, provider);
 			providerState.lastUsedAt[credentialId] = Date.now();
 			return { result: undefined, next: stored };
 		});
-		await this.persistOAuthRefreshSchedule(provider);
+		if (shouldPersistRefreshSchedule) {
+			await this.persistOAuthRefreshSchedule(provider);
+		}
 		this.usageService.clearCredential(provider, credentialId);
 
-		return refreshed;
+		return {
+			credential: effectiveCredential,
+			disposition,
+		};
 	}
 
 	/**
@@ -1790,6 +2247,7 @@ export class AccountManager {
 		const state = await this.syncProviderState(provider);
 		const totalCredentials = state.credentialIds.length;
 		const refreshedCredentialIds: string[] = [];
+		const preservedCredentialIds: string[] = [];
 		const failedCredentials: Array<{ credentialId: string; error: string }> = [];
 		const usageWarnings: Array<{ credentialId: string; warning: string }> = [];
 		const credentialsById = await this.authWriter.getCredentials(state.credentialIds);
@@ -1806,10 +2264,14 @@ export class AccountManager {
 
 			if (credential.type === "oauth") {
 				try {
-					await this.refreshCredential(provider, credentialId);
-					refreshedCredentialIds.push(credentialId);
+					const refreshResult = await this.refreshCredential(provider, credentialId);
+					if (refreshResult.disposition === "preserved_active_token") {
+						preservedCredentialIds.push(credentialId);
+					} else {
+						refreshedCredentialIds.push(credentialId);
+					}
 				} catch (error: unknown) {
-					const message = error instanceof Error ? error.message : String(error);
+					const message = getErrorMessage(error);
 					failedCredentials.push({ credentialId, error: message });
 					continue;
 				}
@@ -1825,7 +2287,7 @@ export class AccountManager {
 					usageWarnings.push({ credentialId, warning: usage.error });
 				}
 			} catch (error: unknown) {
-				const message = error instanceof Error ? error.message : String(error);
+				const message = getErrorMessage(error);
 				usageWarnings.push({
 					credentialId,
 					warning: `Usage reconciliation failed (${message})`,
@@ -1837,6 +2299,7 @@ export class AccountManager {
 			provider,
 			totalCredentials,
 			refreshedCredentialIds,
+			preservedCredentialIds,
 			failedCredentials,
 			usageWarnings,
 		};
@@ -1960,6 +2423,12 @@ export class AccountManager {
 
 	private async clearActiveFailoverChains(): Promise<void> {
 		await this.storage.withLock((state) => {
+			const hadActiveChain = Object.values(state.providers).some(
+				(providerState) => providerState.activeChain !== undefined,
+			);
+			if (!hadActiveChain) {
+				return { result: undefined };
+			}
 			this.clearFailoverStateFromState(state);
 			return { result: undefined, next: state };
 		});
@@ -1971,7 +2440,9 @@ export class AccountManager {
 		available: Set<string>,
 		healthScores: ProviderRotationState["healthState"],
 		usageContext?: CredentialUsageContext,
+		signal?: AbortSignal,
 	): Promise<{ selectedIndex: number; poolMode: RotationMode; poolState: ProviderPoolState } | null> {
+		throwIfAborted(signal, `Pooled credential selection aborted for ${provider}.`);
 		if (!state.pools || state.pools.length === 0) {
 			return null;
 		}
@@ -2003,13 +2474,16 @@ export class AccountManager {
 				);
 				break;
 			case "balancer": {
-				const selectedCredentialId = await this.keyDistributor.acquireKey({
-					providerId: provider,
-					excludedIds: state.credentialIds.filter(
-						(credentialId) => !poolAvailable.has(credentialId),
-					),
-					requestingSessionId: `orchestrator:${provider}:pool:${selection.pool.poolId}`,
-				});
+				const selectedCredentialId = await this.keyDistributor.acquireKey(
+					{
+						providerId: provider,
+						excludedIds: state.credentialIds.filter(
+							(credentialId) => !poolAvailable.has(credentialId),
+						),
+						requestingSessionId: `orchestrator:${provider}:pool:${selection.pool.poolId}`,
+					},
+					{ signal },
+				);
 				selectedIndex = state.credentialIds.indexOf(selectedCredentialId);
 				break;
 			}
@@ -2044,7 +2518,12 @@ export class AccountManager {
 		provider: SupportedProviderId,
 		options?: AcquireCredentialOptions,
 	): Promise<SelectedCredential> {
-		let state = await this.syncProviderState(provider);
+		throwIfAborted(options?.signal, `Credential acquisition aborted for ${provider}.`);
+		let state = await raceWithSignal(
+			this.syncProviderState(provider),
+			options?.signal,
+			`Credential acquisition aborted for ${provider}.`,
+		);
 		if (state.credentialIds.length === 0) {
 			throw new Error(`No credentials available for ${provider}. Open /multi-auth and add an account.`);
 		}
@@ -2055,8 +2534,28 @@ export class AccountManager {
 			disabledCredentialIds.has(state.manualActiveCredentialId)
 		) {
 			await this.clearManualActiveCredential(provider);
-			state = await this.syncProviderState(provider);
+			state = await raceWithSignal(
+				this.syncProviderState(provider),
+				options?.signal,
+				`Credential acquisition aborted for ${provider}.`,
+			);
 			disabledCredentialIds = await this.getDisabledCredentialIds(state);
+		}
+
+		const expiredApiKeyCredentialIds = new Set<string>();
+		if (provider === "cline") {
+			const credentialSnapshot = await raceWithSignal(
+				this.authWriter.getCredentials(state.credentialIds),
+				options?.signal,
+				`Credential acquisition aborted for ${provider}.`,
+			);
+			const expirationCheckTimestamp = Date.now();
+			for (const credentialId of state.credentialIds) {
+				const credential = credentialSnapshot.get(credentialId);
+				if (credential && isExpiredApiKeyCredential(provider, credential, expirationCheckTimestamp)) {
+					expiredApiKeyCredentialIds.add(credentialId);
+				}
+			}
 		}
 
 		const effectiveExcludedCredentialIds = new Set(options?.excludedCredentialIds ?? []);
@@ -2066,9 +2565,16 @@ export class AccountManager {
 		for (const blockedCredentialId of this.cascadeStateManager.getBlockedCredentialIds(provider)) {
 			effectiveExcludedCredentialIds.add(blockedCredentialId);
 		}
+		for (const expiredCredentialId of expiredApiKeyCredentialIds) {
+			effectiveExcludedCredentialIds.add(expiredCredentialId);
+		}
 
 		const selectionCache = options?.selectionCache ?? createCredentialSelectionCache();
-		const usageContext = this.createCredentialUsageContext(state.credentialIds, selectionCache);
+		const usageContext = this.createCredentialUsageContext(
+			state.credentialIds,
+			selectionCache,
+			options?.signal,
+		);
 		const requestedModelId = normalizeModelId(options?.modelId) ?? undefined;
 		const modelEligibility = await this.resolveCredentialModelEligibility(
 			provider,
@@ -2089,8 +2595,13 @@ export class AccountManager {
 		}
 
 		if (effectiveExcludedCredentialIds.size >= state.credentialIds.length) {
+			if (expiredApiKeyCredentialIds.size === state.credentialIds.length) {
+				throw new Error(
+					`All credentials for ${provider} are expired WorkOS session tokens. Re-authenticate the account in /multi-auth.`,
+				);
+			}
 			throw new Error(
-				`All credentials for ${provider} are unavailable (disabled or temporarily exhausted). Add another account in /multi-auth.`,
+				`All credentials for ${provider} are unavailable (disabled, expired, or temporarily exhausted). Add another account in /multi-auth.`,
 			);
 		}
 
@@ -2109,6 +2620,11 @@ export class AccountManager {
 				);
 			}
 			if (effectiveExcludedCredentialIds.has(manualCredentialId)) {
+				if (expiredApiKeyCredentialIds.has(manualCredentialId)) {
+					throw new Error(
+						`Manual active account '${manualCredentialId}' for ${provider} uses an expired WorkOS token. Re-authenticate the account or clear manual active selection in /multi-auth to let automatic rotation recover.`,
+					);
+				}
 				const disabledReason = getDisabledError(state, manualCredentialId);
 				if (disabledReason) {
 					throw new Error(
@@ -2123,7 +2639,11 @@ export class AccountManager {
 			selectedIndex = state.credentialIds.indexOf(manualCredentialId);
 			if (selectedIndex < 0) {
 				await this.clearManualActiveCredential(provider);
-				state = await this.syncProviderState(provider);
+				state = await raceWithSignal(
+					this.syncProviderState(provider),
+					options?.signal,
+					`Credential acquisition aborted for ${provider}.`,
+				);
 				selectedIndex = undefined;
 			} else {
 				const exhaustedUntil = state.quotaExhaustedUntil[manualCredentialId];
@@ -2145,7 +2665,11 @@ export class AccountManager {
 					effectiveExcludedCredentialIds,
 					usageContext,
 				);
-				state = await this.syncProviderState(provider);
+				state = await raceWithSignal(
+					this.syncProviderState(provider),
+					options?.signal,
+					`Credential acquisition aborted for ${provider}.`,
+				);
 				now = Date.now();
 				available = buildAvailableSet(state, now, effectiveExcludedCredentialIds);
 			}
@@ -2175,20 +2699,28 @@ export class AccountManager {
 				available,
 				state.healthState,
 				usageContext,
+				options?.signal,
 			);
 			if (pooledSelection) {
 				selectedIndex = pooledSelection.selectedIndex;
 				selectedRotationMode = pooledSelection.poolMode;
 				selectedPoolState = pooledSelection.poolState;
 			} else if (state.rotationMode === "balancer") {
-				const selectedCredentialId = await this.keyDistributor.acquireKey({
-					providerId: provider,
-					excludedIds: [...effectiveExcludedCredentialIds],
-					requestingSessionId: `orchestrator:${provider}`,
-				});
+				const selectedCredentialId = await this.keyDistributor.acquireKey(
+					{
+						providerId: provider,
+						excludedIds: [...effectiveExcludedCredentialIds],
+						requestingSessionId: `orchestrator:${provider}`,
+					},
+					{ signal: options?.signal },
+				);
 				selectedIndex = state.credentialIds.indexOf(selectedCredentialId);
 				if (selectedIndex < 0) {
-					state = await this.syncProviderState(provider);
+					state = await raceWithSignal(
+						this.syncProviderState(provider),
+						options?.signal,
+						`Credential acquisition aborted for ${provider}.`,
+					);
 					selectedIndex = state.credentialIds.indexOf(selectedCredentialId);
 				}
 			} else {
@@ -2204,9 +2736,17 @@ export class AccountManager {
 		}
 
 		const credentialId = state.credentialIds[selectedIndex];
-		const credential = await this.authWriter.getCredential(credentialId);
+		const credential = await raceWithSignal(
+			this.authWriter.getCredential(credentialId),
+			options?.signal,
+			`Credential acquisition aborted for ${provider}.`,
+		);
 		if (!credential) {
-			await this.syncProviderState(provider);
+			await raceWithSignal(
+				this.syncProviderState(provider),
+				options?.signal,
+				`Credential acquisition aborted for ${provider}.`,
+			);
 			throw new Error(
 				`Credential ${credentialId} is missing from auth.json. Open /multi-auth and add the account again if needed.`,
 			);
@@ -2220,39 +2760,59 @@ export class AccountManager {
 				excludedCredentialIds: nextExcludedCredentialIds,
 				modelId: options?.modelId,
 				selectionCache,
+				signal: options?.signal,
 			});
 		}
 
 		const freshCredential =
 			credential.type === "oauth"
-				? await this.refreshIfNeeded(provider, credentialId, credential)
+				? await this.refreshIfNeeded(provider, credentialId, credential, options?.signal)
 				: credential;
 		const effectiveRotationMode = selectedRotationMode ?? state.rotationMode;
+		throwIfAborted(options?.signal, `Credential acquisition aborted for ${provider}.`);
 
-		await this.storage.withLock((stored) => {
-			const providerState = getProviderState(stored, provider);
-			const nextRoundRobinIndex =
-				providerState.credentialIds.length > 0
-					? (selectedIndex + 1) % providerState.credentialIds.length
-					: selectedIndex;
-			providerState.activeIndex = providerState.manualActiveCredentialId
-				? selectedIndex
-				: effectiveRotationMode === "round-robin"
-					? nextRoundRobinIndex
-					: selectedIndex;
-			providerState.usageCount[credentialId] = (providerState.usageCount[credentialId] ?? 0) + 1;
-			providerState.lastUsedAt[credentialId] = Date.now();
+		const selectedAt = Date.now();
+		const hasSelectionExclusions = effectiveExcludedCredentialIds.size > 0;
+		const nextRoundRobinIndex =
+			state.credentialIds.length > 0 ? (selectedIndex + 1) % state.credentialIds.length : selectedIndex;
+		const nextActiveIndex = state.manualActiveCredentialId
+			? selectedIndex
+			: effectiveRotationMode === "round-robin"
+				? hasSelectionExclusions
+					? selectedIndex
+					: nextRoundRobinIndex
+				: selectedIndex;
+		if (this.isLightweightRotationProvider(provider)) {
+			this.recordLightweightSelection(
+				provider,
+				state,
+				credentialId,
+				selectedIndex,
+				nextActiveIndex,
+				selectedAt,
+				selectedPoolState,
+			);
 			if (selectedPoolState) {
-				providerState.poolState = { ...selectedPoolState };
+				await this.flushLightweightRotationStateIfNeeded(provider);
 			}
-			return { result: undefined, next: stored };
-		});
+		} else {
+			await this.storage.withLock((stored) => {
+				const providerState = getProviderState(stored, provider);
+				providerState.activeIndex = nextActiveIndex;
+				providerState.usageCount[credentialId] = (providerState.usageCount[credentialId] ?? 0) + 1;
+				providerState.lastUsedAt[credentialId] = selectedAt;
+				if (selectedPoolState) {
+					providerState.poolState = { ...selectedPoolState };
+				}
+				return { result: undefined, next: stored };
+			});
+		}
 
 		return {
 			provider,
 			credentialId,
 			credential: freshCredential,
-			secret: getCredentialSecret(freshCredential),
+			secret: getCredentialRequestSecret(provider, freshCredential),
 			index: selectedIndex,
 		};
 	}
@@ -2422,20 +2982,24 @@ export class AccountManager {
 				return { result: undefined };
 			}
 
+			let didChange = false;
 			if (providerState.transientErrorCount[credentialId] !== undefined) {
 				delete providerState.transientErrorCount[credentialId];
+				didChange = true;
 			}
 			if (providerState.lastTransientError?.[credentialId] !== undefined) {
 				delete providerState.lastTransientError[credentialId];
+				didChange = true;
 			}
 			if (
 				typeof providerState.quotaExhaustedUntil[credentialId] === "number" &&
 				providerState.quotaExhaustedUntil[credentialId] <= Date.now()
 			) {
 				delete providerState.quotaExhaustedUntil[credentialId];
+				didChange = true;
 			}
 
-			return { result: undefined, next: state };
+			return didChange ? { result: undefined, next: state } : { result: undefined };
 		});
 	}
 
@@ -2450,25 +3014,25 @@ export class AccountManager {
 				return { result: undefined };
 			}
 
-			// Clear the exhausted timestamp
+			let didChange = false;
 			if (providerState.quotaExhaustedUntil[credentialId] !== undefined) {
 				delete providerState.quotaExhaustedUntil[credentialId];
+				didChange = true;
 			}
-
-			// Clear the error message
 			if (providerState.lastQuotaError?.[credentialId] !== undefined) {
 				delete providerState.lastQuotaError[credentialId];
+				didChange = true;
 			}
-
-			// Reset weekly quota attempt counter on success
 			if (providerState.weeklyQuotaAttempts?.[credentialId] !== undefined) {
 				delete providerState.weeklyQuotaAttempts[credentialId];
+				didChange = true;
 			}
 			if (providerState.quotaStates?.[credentialId] !== undefined) {
 				delete providerState.quotaStates[credentialId];
+				didChange = true;
 			}
 
-			return { result: undefined, next: state };
+			return didChange ? { result: undefined, next: state } : { result: undefined };
 		});
 	}
 
@@ -2476,6 +3040,7 @@ export class AccountManager {
 	 * Updates rotation mode for a provider.
 	 */
 	async setRotationMode(provider: SupportedProviderId, rotationMode: RotationMode): Promise<void> {
+		await this.flushLightweightRotationStateIfNeeded(provider);
 		await this.storage.withLock((state) => {
 			const providerState = getProviderState(state, provider);
 			providerState.rotationMode = rotationMode;
@@ -2618,7 +3183,7 @@ export class AccountManager {
 				credential.type === "oauth"
 					? inferCredentialFriendlyName(provider, credentialId, credential)
 					: undefined;
-			const expiresAt = credential.type === "oauth" ? credential.expires : null;
+			const expiresAt = getCredentialExpiration(provider, credential);
 
 			credentials.push({
 				credentialId,
@@ -2719,6 +3284,10 @@ export class AccountManager {
 		available: Set<string>,
 		usageContext?: CredentialUsageContext,
 	): Promise<number | undefined> {
+		throwIfAborted(
+			usageContext?.signal,
+			`Usage-based credential selection aborted for ${provider}.`,
+		);
 		const fallbackIndex = getUsageBasedCandidateIndex(state, available);
 		const candidates = state.credentialIds
 			.map((credentialId, index) => ({
@@ -2745,6 +3314,11 @@ export class AccountManager {
 					usageContext,
 				),
 			),
+		);
+
+		throwIfAborted(
+			usageContext?.signal,
+			`Usage-based credential selection aborted for ${provider}.`,
 		);
 
 		const ranked = candidates
@@ -2817,6 +3391,10 @@ export class AccountManager {
 		excludedCredentialIds?: Set<string>,
 		usageContext?: CredentialUsageContext,
 	): Promise<void> {
+		throwIfAborted(
+			usageContext?.signal,
+			`Blocked credential reconciliation aborted for ${provider}.`,
+		);
 		const now = Date.now();
 		const blockedCredentialIds = state.credentialIds.filter((credentialId) => {
 			if (excludedCredentialIds?.has(credentialId)) {
@@ -2841,6 +3419,10 @@ export class AccountManager {
 					usageContext,
 				);
 			}),
+		);
+		throwIfAborted(
+			usageContext?.signal,
+			`Blocked credential reconciliation aborted for ${provider}.`,
 		);
 	}
 
@@ -2901,29 +3483,56 @@ export class AccountManager {
 		provider: SupportedProviderId,
 		credentialId: string,
 		credential: StoredOAuthCredential,
+		signal?: AbortSignal,
 	): Promise<StoredOAuthCredential> {
-		const safetyWindowMs = this.extensionConfig.oauthRefresh.enabled
-			? this.extensionConfig.oauthRefresh.safetyWindowMs
-			: 0;
+		if (!this.isOAuthRefreshManagedForProvider(provider)) {
+			return credential;
+		}
+
+		const safetyWindowMs = getOAuthRefreshLeadTimeMs(
+			provider,
+			this.extensionConfig.oauthRefresh.safetyWindowMs,
+		);
 		if (Date.now() < credential.expires - safetyWindowMs) {
 			return credential;
 		}
 
-		const refreshedCredential = await this.refreshCredentialToken(provider, credentialId, credential);
-		this.scheduleOAuthRefresh(provider, credentialId, refreshedCredential);
-		await this.persistOAuthRefreshSchedule(provider);
-		return refreshedCredential;
+		try {
+			const refreshedCredential = await this.refreshCredentialToken(
+				provider,
+				credentialId,
+				credential,
+				signal,
+			);
+			this.scheduleOAuthRefresh(provider, credentialId, refreshedCredential);
+			await this.persistOAuthRefreshSchedule(provider);
+			return refreshedCredential;
+		} catch (error) {
+			if (
+				isOAuthRefreshFailureError(error) &&
+				shouldPreserveActiveOAuthCredentialAfterRefreshFailure(provider, credential, error)
+			) {
+				return credential;
+			}
+			throw error;
+		}
 	}
 
 	private async refreshCredentialToken(
 		provider: SupportedProviderId,
 		credentialId: string,
 		credential: StoredOAuthCredential,
+		signal?: AbortSignal,
 	): Promise<StoredOAuthCredential> {
+		this.assertOAuthRefreshManagedForProvider(provider);
 		const refreshKey = `${provider}:${credentialId}`;
 		const inFlightRefresh = this.oauthRefreshInFlight.get(refreshKey);
 		if (inFlightRefresh) {
-			return inFlightRefresh;
+			return raceWithSignal(
+				inFlightRefresh,
+				signal,
+				`OAuth refresh aborted for ${provider}/${credentialId}.`,
+			);
 		}
 
 		const refreshPromise = (async (): Promise<StoredOAuthCredential> => {
@@ -2943,12 +3552,20 @@ export class AccountManager {
 					return recoveredCredential;
 				}
 
-				const failure = await this.logAndHandleOAuthRefreshFailure(provider, credentialId, error);
+				const failure = await this.logAndHandleOAuthRefreshFailure(
+					provider,
+					credentialId,
+					credential,
+					error,
+				);
 				throw failure;
 			}
 
 			await this.authWriter.setOAuthCredential(credentialId, refreshed);
-			await this.clearRecoveredOAuthRefreshFailureState(provider, credentialId);
+			await this.clearRecoveredOAuthRefreshFailureState(provider, credentialId, {
+				type: "oauth",
+				...refreshed,
+			});
 			return {
 				type: "oauth",
 				...refreshed,
@@ -2958,7 +3575,11 @@ export class AccountManager {
 		});
 
 		this.oauthRefreshInFlight.set(refreshKey, refreshPromise);
-		return refreshPromise;
+		return raceWithSignal(
+			refreshPromise,
+			signal,
+			`OAuth refresh aborted for ${provider}/${credentialId}.`,
+		);
 	}
 
 	private deduplicateCredentialEntries(
@@ -2966,7 +3587,7 @@ export class AccountManager {
 		credentialEntries: readonly AuthCredentialEntry[],
 	): string[] {
 		const credentialIds = credentialEntries.map((entry) => entry.credentialId);
-		if (provider !== "openai-codex" || credentialIds.length <= 1) {
+		if ((provider !== "openai-codex" && provider !== "cline") || credentialIds.length <= 1) {
 			return credentialIds;
 		}
 
@@ -2980,7 +3601,14 @@ export class AccountManager {
 				continue;
 			}
 
-			const identityKey = buildCodexIdentityKey(entry.credentialId, entry.credential);
+			const identityKey =
+				provider === "cline"
+					? buildClineIdentityKey(entry.credential)
+					: buildCodexIdentityKey(entry.credentialId, entry.credential);
+			if (!identityKey) {
+				continue;
+			}
+
 			const existing = selectedByIdentity.get(identityKey);
 			if (!existing) {
 				selectedByIdentity.set(identityKey, {
@@ -3015,6 +3643,7 @@ export class AccountManager {
 
 	private async syncProviderState(provider: SupportedProviderId): Promise<ProviderRotationState> {
 		await this.ensureInitialized();
+		const isLightweightProvider = this.isLightweightRotationProvider(provider);
 		const credentialEntries = await this.authWriter.getProviderCredentialEntries(provider);
 		const credentialIds = credentialEntries.map((entry) => entry.credentialId);
 		const normalizedCredentialIds = this.deduplicateCredentialEntries(provider, credentialEntries);
@@ -3034,11 +3663,22 @@ export class AccountManager {
 			migrateLegacyCodexRefreshDisabledCredentials(normalizedProviderState);
 		}
 		normalizeProviderState(normalizedProviderState);
+		clearRecoveredOAuthRefreshFailureStateForProvider(
+			provider,
+			normalizedProviderState,
+			credentialEntries,
+		);
+		if (provider === "cline" || !this.isOAuthRefreshManagedForProvider(provider)) {
+			clearDisabledOAuthRefreshFailureStateForProvider(provider, normalizedProviderState);
+		}
 
 		if (haveEquivalentProviderState(currentProviderState, normalizedProviderState)) {
-			this.loadProviderTelemetry(provider, currentProviderState);
-			await this.syncProviderOAuthSchedules(provider, currentProviderState, credentialEntries);
-			return currentProviderState;
+			const effectiveProviderState = isLightweightProvider
+				? this.applyLightweightRotationState(provider, cloneProviderState(currentProviderState))
+				: currentProviderState;
+			this.loadProviderTelemetry(provider, effectiveProviderState);
+			await this.syncProviderOAuthSchedules(provider, effectiveProviderState, credentialEntries);
+			return effectiveProviderState;
 		}
 
 		const providerState = await this.storage.withLock((state) => {
@@ -3048,14 +3688,25 @@ export class AccountManager {
 				migrateLegacyCodexRefreshDisabledCredentials(storedProviderState);
 			}
 			normalizeProviderState(storedProviderState);
+			clearRecoveredOAuthRefreshFailureStateForProvider(
+				provider,
+				storedProviderState,
+				credentialEntries,
+			);
+			if (provider === "cline" || !this.isOAuthRefreshManagedForProvider(provider)) {
+				clearDisabledOAuthRefreshFailureStateForProvider(provider, storedProviderState);
+			}
 			return {
 				result: cloneProviderState(storedProviderState),
 				next: state,
 			};
 		});
-		this.loadProviderTelemetry(provider, providerState);
-		await this.syncProviderOAuthSchedules(provider, providerState, credentialEntries);
-		return providerState;
+		const effectiveProviderState = isLightweightProvider
+			? this.applyLightweightRotationState(provider, cloneProviderState(providerState))
+			: providerState;
+		this.loadProviderTelemetry(provider, effectiveProviderState);
+		await this.syncProviderOAuthSchedules(provider, effectiveProviderState, credentialEntries);
+		return effectiveProviderState;
 	}
 
 	/**
@@ -3096,6 +3747,9 @@ export class AccountManager {
 						migrateLegacyCodexRefreshDisabledCredentials(providerState);
 					}
 					normalizeProviderState(providerState);
+					if (provider === "cline" || !this.isOAuthRefreshManagedForProvider(provider)) {
+						clearDisabledOAuthRefreshFailureStateForProvider(provider, providerState);
+					}
 				}
 				for (const result of normalizedProviders) {
 					const providerState = getProviderState(state, result.provider);
@@ -3145,13 +3799,30 @@ export class AccountManager {
 	}
 
 	private async persistProviderTelemetry(provider: SupportedProviderId): Promise<void> {
+		if (this.isLightweightRotationProvider(provider)) {
+			const providerState = this.applyLightweightRotationState(
+				provider,
+				await this.storage.readProviderState(provider),
+			);
+			this.recordLightweightTelemetry(provider, providerState.credentialIds);
+			await this.lightweightRotationState.flushProvider(provider);
+			return;
+		}
 		await this.storage.withLock((state) => {
-			const providerState = getProviderState(state, provider);
-			providerState.cascadeState = {
+			const storedProviderState = getProviderState(state, provider);
+			const nextCascadeState = {
 				[provider]: this.cascadeStateManager.getProviderState(provider),
 			};
-			providerState.healthState = this.healthScorer.exportState(providerState.credentialIds);
-			normalizeProviderState(providerState);
+			const nextHealthState = this.healthScorer.exportState(storedProviderState.credentialIds);
+			const didChange =
+				!haveSameJsonValue(storedProviderState.cascadeState, nextCascadeState) ||
+				!haveSameJsonValue(storedProviderState.healthState, nextHealthState);
+			if (!didChange) {
+				return { result: undefined };
+			}
+			storedProviderState.cascadeState = nextCascadeState;
+			storedProviderState.healthState = nextHealthState;
+			normalizeProviderState(storedProviderState);
 			return { result: undefined, next: state };
 		});
 	}
@@ -3161,8 +3832,18 @@ export class AccountManager {
 		credentialId: string,
 		credential: StoredOAuthCredential,
 	): void {
+		if (!this.isOAuthRefreshManagedForProvider(provider)) {
+			this.oauthRefreshScheduler.cancelRefresh(credentialId);
+			return;
+		}
+
 		const expiration = determineTokenExpiration(credential.access, credential.expires);
-		this.oauthRefreshScheduler.scheduleRefresh(credentialId, provider, expiration.expiresAt);
+		const scheduledExpiration = getSchedulerExpirationForRefreshLeadTime(
+			provider,
+			expiration.expiresAt,
+			this.extensionConfig.oauthRefresh.safetyWindowMs,
+		);
+		this.oauthRefreshScheduler.scheduleRefresh(credentialId, provider, scheduledExpiration);
 	}
 
 	private async syncProviderOAuthSchedules(
@@ -3170,6 +3851,17 @@ export class AccountManager {
 		providerState: ProviderRotationState,
 		credentialEntries?: readonly AuthCredentialEntry[],
 	): Promise<void> {
+		if (!this.isOAuthRefreshManagedForProvider(provider)) {
+			for (const credentialId of providerState.credentialIds) {
+				this.oauthRefreshScheduler.cancelRefresh(credentialId);
+			}
+			for (const credentialId of Object.keys(providerState.oauthRefreshScheduled ?? {})) {
+				this.oauthRefreshScheduler.cancelRefresh(credentialId);
+			}
+			await this.persistOAuthRefreshSchedule(provider);
+			return;
+		}
+
 		const validCredentialIds = new Set(providerState.credentialIds);
 		const availableCredentialIds = buildAvailableSet(providerState, Date.now());
 		const credentialsById = credentialEntries
@@ -3215,6 +3907,12 @@ export class AccountManager {
 		provider: SupportedProviderId,
 		credentialId: string,
 	): Promise<number | undefined> {
+		if (!this.isOAuthRefreshManagedForProvider(provider)) {
+			this.oauthRefreshScheduler.cancelRefresh(credentialId);
+			await this.persistOAuthRefreshSchedule(provider);
+			return undefined;
+		}
+
 		const credential = await this.authWriter.getCredential(credentialId);
 		if (!credential || credential.type !== "oauth") {
 			this.oauthRefreshScheduler.cancelRefresh(credentialId);
@@ -3240,7 +3938,13 @@ export class AccountManager {
 		credentialIds: readonly string[],
 		modelId: string | undefined,
 		usageContext?: CredentialUsageContext,
+		signal?: AbortSignal,
 	): Promise<CredentialModelEligibility> {
+		const effectiveSignal = signal ?? usageContext?.signal;
+		throwIfAborted(
+			effectiveSignal,
+			`Model eligibility resolution aborted for ${provider}/${modelId ?? "unknown"}.`,
+		);
 		const normalizedModelId = normalizeModelId(modelId) ?? undefined;
 		if (!modelRequiresEntitlement(provider, normalizedModelId)) {
 			return {
@@ -3263,17 +3967,26 @@ export class AccountManager {
 			),
 		);
 
-		const eligibleCredentialIds: string[] = [];
+		throwIfAborted(
+			effectiveSignal,
+			`Model eligibility resolution aborted for ${provider}/${normalizedModelId ?? "unknown"}.`,
+		);
+
+		const verifiedEligibleCredentialIds: string[] = [];
+		const usageFailureCredentialIds: string[] = [];
 		const ineligibleCredentialIds: string[] = [];
 		let hasUnknownPlanType = false;
 		let hasUsageFailure = false;
+		const allowUnverifiedOnUsageFailure =
+			provider === "openai-codex" &&
+			this.extensionConfig.modelEntitlements.codex.usageLookupFailureMode === "allow-unverified";
 
 		for (let index = 0; index < credentialIds.length; index += 1) {
 			const credentialId = credentialIds[index];
 			const usageResult = usageResults[index];
 
 			if (usageResult.status === "rejected") {
-				ineligibleCredentialIds.push(credentialId);
+				usageFailureCredentialIds.push(credentialId);
 				hasUsageFailure = true;
 				continue;
 			}
@@ -3281,10 +3994,11 @@ export class AccountManager {
 			const usage = usageResult.value;
 			const snapshot = usage.snapshot;
 			if (!snapshot) {
-				ineligibleCredentialIds.push(credentialId);
 				if (usage.error) {
+					usageFailureCredentialIds.push(credentialId);
 					hasUsageFailure = true;
 				} else {
+					ineligibleCredentialIds.push(credentialId);
 					hasUnknownPlanType = true;
 				}
 				continue;
@@ -3292,12 +4006,27 @@ export class AccountManager {
 
 			const planType = normalizeCodexPlanType(snapshot.planType);
 			if (isPlanEligibleForModel(planType)) {
-				eligibleCredentialIds.push(credentialId);
-			} else {
+				verifiedEligibleCredentialIds.push(credentialId);
+				continue;
+			}
+
+			ineligibleCredentialIds.push(credentialId);
+			if (planType === "unknown") {
+				hasUnknownPlanType = true;
+			}
+		}
+
+		let eligibleCredentialIds = [...verifiedEligibleCredentialIds];
+		if (eligibleCredentialIds.length === 0 && allowUnverifiedOnUsageFailure && usageFailureCredentialIds.length > 0) {
+			eligibleCredentialIds = [...usageFailureCredentialIds];
+			multiAuthDebugLogger.log("codex_entitlement_usage_failure_bypass", {
+				provider,
+				modelId: normalizedModelId ?? "unknown",
+				credentialIds: usageFailureCredentialIds,
+			});
+		} else {
+			for (const credentialId of usageFailureCredentialIds) {
 				ineligibleCredentialIds.push(credentialId);
-				if (planType === "unknown") {
-					hasUnknownPlanType = true;
-				}
 			}
 		}
 
@@ -3308,7 +4037,7 @@ export class AccountManager {
 			} else if (hasUnknownPlanType) {
 				failureMessage = `Unable to determine plan type for any credential. Cannot verify eligibility for ${formatModelReference(provider, normalizedModelId ?? "unknown")}.`;
 			} else {
-				failureMessage = `No credentials available with a paid plan for ${formatModelReference(provider, normalizedModelId ?? "unknown")}. Upgrade to ChatGPT Plus, Pro, or Team to use this model.`;
+				failureMessage = `No credentials available with a paid plan for ${formatModelReference(provider, normalizedModelId ?? "unknown")}. Upgrade to ChatGPT Plus, Pro, Team, Business, or Enterprise to use this model.`;
 			}
 		}
 

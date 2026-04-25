@@ -7,6 +7,7 @@ import {
 	cloneHistoryPersistenceConfig,
 	type HistoryPersistenceConfig,
 } from "./config.js";
+import { getErrorMessage } from "./auth-error-utils.js";
 import { isRetryableFileAccessError, readTextSnapshotWithRetries, writeTextSnapshotWithRetries } from "./file-retry.js";
 import { MultiAuthHistoryStore } from "./history-storage.js";
 import { RollingMetricSeries, type MetricSeriesSnapshot } from "./performance-metrics.js";
@@ -109,8 +110,10 @@ async function acquireFileLock(
 		} catch (error) {
 			const lockError = toError(error);
 			const maybeCode = (lockError as Error & { code?: unknown }).code;
+			const isExistingLockError = maybeCode === "EEXIST";
+			const isRetryableAccessError = isRetryableFileAccessError(lockError);
 
-			if (maybeCode !== "EEXIST") {
+			if (!isExistingLockError && !isRetryableAccessError) {
 				throw lockError;
 			}
 
@@ -133,7 +136,9 @@ async function acquireFileLock(
 			}
 
 			if (attempt >= maxAttempts) {
-				throw new Error(`Timed out acquiring lock for '${filePath}' after ${maxAttempts} attempt(s).`);
+				throw new Error(
+					`Timed out acquiring lock for '${filePath}' after ${maxAttempts} attempt(s): ${lockError.message}`,
+				);
 			}
 
 			const baseDelay = Math.min(
@@ -685,9 +690,7 @@ function parseState(content: string | undefined): MultiAuthState {
 	try {
 		parsed = JSON.parse(content);
 	} catch (error) {
-		throw new Error(
-			`Invalid JSON in multi-auth.json: ${error instanceof Error ? error.message : String(error)}`,
-		);
+		throw new Error(`Invalid JSON in multi-auth.json: ${getErrorMessage(error)}`);
 	}
 
 	if (!isRecord(parsed)) {

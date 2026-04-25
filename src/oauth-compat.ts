@@ -1,11 +1,18 @@
 import {
 	getOAuthProvider as getOAuthProviderFromPiAi,
 	getOAuthProviders as getOAuthProvidersFromPiAi,
+	registerOAuthProvider as registerOAuthProviderFromPiAi,
+	resetOAuthProviders as resetOAuthProvidersFromPiAi,
+	unregisterOAuthProvider as unregisterOAuthProviderFromPiAi,
 	type OAuthCredentials,
 	type OAuthLoginCallbacks,
 	type OAuthProviderId,
 	type OAuthProviderInterface,
 } from "@mariozechner/pi-ai/oauth";
+import {
+	formatOAuthRefreshFailureSummary,
+	isRecord,
+} from "./auth-error-utils.js";
 import { extractCodexCredentialIdentity } from "./openai-codex-identity.js";
 import { determineTokenExpiration } from "./oauth-refresh-scheduler.js";
 import {
@@ -14,15 +21,11 @@ import {
 } from "./types-oauth.js";
 
 const OPENAI_CODEX_PROVIDER_ID = "openai-codex";
+const OPENAI_CODEX_PROVIDER_LABEL = "OpenAI Codex";
 const OPENAI_CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token";
 const OPENAI_CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
-const MAX_OAUTH_ERROR_BODY_CHARS = 2_000;
 const DEFAULT_OAUTH_REFRESH_TIMEOUT_MS = 15_000;
 const OAUTH_REFRESH_TIMEOUT_ERROR_CODE = "request_timeout";
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function asNonEmptyString(value: unknown): string | undefined {
 	if (typeof value !== "string") {
@@ -33,19 +36,6 @@ function asNonEmptyString(value: unknown): string | undefined {
 	return normalized.length > 0 ? normalized : undefined;
 }
 
-function getErrorMessage(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
-}
-
-function truncateResponseBody(value: string): string | undefined {
-	const normalized = value.trim();
-	if (!normalized) {
-		return undefined;
-	}
-	return normalized.length <= MAX_OAUTH_ERROR_BODY_CHARS
-		? normalized
-		: `${normalized.slice(0, MAX_OAUTH_ERROR_BODY_CHARS)}…`;
-}
 
 function parseJsonRecord(value: string): Record<string, unknown> | null {
 	if (!value.trim()) {
@@ -133,9 +123,15 @@ async function fetchCodexRefreshResponse(
 			);
 		}
 		throw new OAuthRefreshFailureError(
-			`OpenAI Codex token refresh request failed: ${getErrorMessage(error)}`,
+			formatOAuthRefreshFailureSummary({
+				providerLabel: OPENAI_CODEX_PROVIDER_LABEL,
+				reason: "request_failed",
+				permanent: false,
+				source: "extension",
+			}),
 			{
 				providerId: OPENAI_CODEX_PROVIDER_ID,
+				reason: "request_failed",
 				permanent: false,
 				source: "extension",
 			},
@@ -146,26 +142,19 @@ async function fetchCodexRefreshResponse(
 	}
 }
 
-function buildCodexRefreshFailureMessage(
+function createCodexRefreshFailureMessage(
 	status: number,
 	errorCode: string | undefined,
-	errorDescription: string | undefined,
-	responseBody: string | undefined,
 	permanent: boolean,
 ): string {
-	const parts = [`OpenAI Codex token refresh failed with HTTP ${status}`];
-	if (errorCode) {
-		parts.push(`error=${errorCode}`);
-	}
-	if (errorDescription) {
-		parts.push(`description=${errorDescription}`);
-	} else if (responseBody) {
-		parts.push(`response=${responseBody}`);
-	}
-
-	return permanent
-		? `OpenAI Codex refresh rejected permanently. ${parts.join("; ")}`
-		: parts.join("; ");
+	return formatOAuthRefreshFailureSummary({
+		providerLabel: OPENAI_CODEX_PROVIDER_LABEL,
+		status,
+		errorCode,
+		reason: permanent ? "token_rejected" : "http_error",
+		permanent,
+		source: "extension",
+	});
 }
 
 async function refreshOpenAICodexCredential(
@@ -174,17 +163,25 @@ async function refreshOpenAICodexCredential(
 ): Promise<OAuthCredentials> {
 	const refreshToken = asNonEmptyString(credentials.refresh);
 	if (!refreshToken) {
-		throw new OAuthRefreshFailureError("OpenAI Codex refresh token is missing.", {
-			providerId: OPENAI_CODEX_PROVIDER_ID,
-			permanent: true,
-			source: "extension",
-		});
+		throw new OAuthRefreshFailureError(
+			formatOAuthRefreshFailureSummary({
+				providerLabel: OPENAI_CODEX_PROVIDER_LABEL,
+				reason: "missing_refresh_token",
+				permanent: true,
+				source: "extension",
+			}),
+			{
+				providerId: OPENAI_CODEX_PROVIDER_ID,
+				reason: "missing_refresh_token",
+				permanent: true,
+				source: "extension",
+			},
+		);
 	}
 
 	const response = await fetchCodexRefreshResponse(refreshToken, requestTimeoutMs);
 	const responseText = await response.text().catch(() => "");
 	const parsedBody = parseJsonRecord(responseText);
-	const responseBody = truncateResponseBody(responseText);
 	const { errorCode, errorDescription } = extractCodexRefreshErrorDetails(parsedBody);
 
 	if (!response.ok) {
@@ -192,22 +189,15 @@ async function refreshOpenAICodexCredential(
 			response.status,
 			errorCode,
 			errorDescription,
-			responseBody,
+			responseText,
 		);
 		throw new OAuthRefreshFailureError(
-			buildCodexRefreshFailureMessage(
-				response.status,
-				errorCode,
-				errorDescription,
-				responseBody,
-				permanent,
-			),
+			createCodexRefreshFailureMessage(response.status, errorCode, permanent),
 			{
 				providerId: OPENAI_CODEX_PROVIDER_ID,
 				status: response.status,
 				errorCode,
-				errorDescription,
-				responseBody,
+				reason: permanent ? "token_rejected" : "http_error",
 				permanent,
 				source: "extension",
 			},
@@ -223,10 +213,15 @@ async function refreshOpenAICodexCredential(
 
 	if (!accessToken || !nextRefreshToken || expiresIn === undefined) {
 		throw new OAuthRefreshFailureError(
-			"OpenAI Codex refresh response was missing required token fields.",
+			formatOAuthRefreshFailureSummary({
+				providerLabel: OPENAI_CODEX_PROVIDER_LABEL,
+				reason: "missing_required_fields",
+				permanent: false,
+				source: "extension",
+			}),
 			{
 				providerId: OPENAI_CODEX_PROVIDER_ID,
-				responseBody,
+				reason: "missing_required_fields",
 				permanent: false,
 				source: "extension",
 			},
@@ -239,9 +234,15 @@ async function refreshOpenAICodexCredential(
 	});
 	if (!identity.accountId) {
 		throw new OAuthRefreshFailureError(
-			"OpenAI Codex refresh succeeded but the access token did not contain account identity metadata.",
+			formatOAuthRefreshFailureSummary({
+				providerLabel: OPENAI_CODEX_PROVIDER_LABEL,
+				reason: "missing_account_identity",
+				permanent: false,
+				source: "extension",
+			}),
 			{
 				providerId: OPENAI_CODEX_PROVIDER_ID,
+				reason: "missing_account_identity",
 				permanent: false,
 				source: "extension",
 			},
@@ -273,6 +274,18 @@ export function getOAuthProvider(
 
 export function getOAuthProviders(): OAuthProviderInterface[] {
 	return getOAuthProvidersFromPiAi();
+}
+
+export function registerOAuthProvider(provider: OAuthProviderInterface): void {
+	registerOAuthProviderFromPiAi(provider);
+}
+
+export function unregisterOAuthProvider(id: OAuthProviderId): void {
+	unregisterOAuthProviderFromPiAi(id);
+}
+
+export function resetOAuthProviders(): void {
+	resetOAuthProvidersFromPiAi();
 }
 
 export interface OAuthRefreshExecutionOptions {
@@ -310,4 +323,9 @@ export async function refreshOAuthCredential(
 	return provider.refreshToken(credentials);
 }
 
-export type { OAuthCredentials, OAuthLoginCallbacks };
+export type {
+	OAuthCredentials,
+	OAuthLoginCallbacks,
+	OAuthProviderId,
+	OAuthProviderInterface,
+};

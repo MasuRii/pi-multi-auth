@@ -1,4 +1,5 @@
-import { appendFile } from "node:fs/promises";
+import { appendFile, chmod } from "node:fs/promises";
+import { getErrorMessage } from "./auth-error-utils.js";
 
 const DEFAULT_FLUSH_INTERVAL_MS = 5_000;
 const DEFAULT_FLUSH_ENTRY_LIMIT = 100;
@@ -112,27 +113,31 @@ export class AsyncBufferedLogWriter {
 			return;
 		}
 
-		const flushPromise = appendFile(this.options.logPath, payload, "utf-8")
-			.catch(() => {
+		const flushPromise = (async () => {
+			try {
+				await appendFile(this.options.logPath, payload, "utf-8");
+			} catch {
 				this.requeuePayload(payload);
-			})
-			.finally(async () => {
-				this.flushPromise = null;
-				if (this.flushRequestedWhileBusy || this.lines.length > 0) {
-					this.flushRequestedWhileBusy = false;
-					await this.flush();
-				}
-			});
+				return;
+			}
+			await this.hardenLogPermissions();
+		})().finally(async () => {
+			this.flushPromise = null;
+			if (this.flushRequestedWhileBusy || this.lines.length > 0) {
+				this.flushRequestedWhileBusy = false;
+				await this.flush();
+			}
+		});
 		this.flushPromise = flushPromise;
 		await flushPromise;
 	}
 
 	private ensureReady(): string | undefined {
-		if (this.directoryReady) {
-			return undefined;
-		}
 		if (this.initializationError) {
 			return this.initializationError;
+		}
+		if (this.directoryReady) {
+			return undefined;
 		}
 
 		const error = this.options.ensureDirectory();
@@ -143,6 +148,19 @@ export class AsyncBufferedLogWriter {
 
 		this.directoryReady = true;
 		return undefined;
+	}
+
+	private async hardenLogPermissions(): Promise<void> {
+		if (process.platform === "win32") {
+			return;
+		}
+
+		try {
+			await chmod(this.options.logPath, 0o600);
+		} catch (error: unknown) {
+			this.initializationError = `Failed to harden debug log permissions for '${this.options.logPath}': ${getErrorMessage(error)}`;
+			this.setEnabled(false);
+		}
 	}
 
 	private registerShutdownHooks(): void {

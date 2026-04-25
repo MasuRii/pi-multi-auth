@@ -10,6 +10,7 @@ import {
 	toggleBatchSelection,
 } from "./account-batch-selection.js";
 import { runOAuthLoginDialog } from "./oauth-login-flow.js";
+import { getErrorMessage } from "./auth-error-utils.js";
 import { parseApiKeyBatchInput } from "./credential-display.js";
 import { ModalVisibilityController } from "./modal-visibility.js";
 import { formatResetCountdown } from "./formatters/bar.js";
@@ -483,13 +484,6 @@ function resolveUsageWindowLabel(
 	}
 
 	return durationLabel;
-}
-
-function getErrorMessage(error: unknown): string {
-	if (error instanceof Error) {
-		return error.message;
-	}
-	return String(error);
 }
 
 async function loginProviderFromModal(
@@ -1902,12 +1896,12 @@ class MultiAuthManagerModal {
 				? `Refreshing usage state for ${selectedEntry.credential.credentialId}...`
 				: `Refreshing token for ${selectedEntry.credential.credentialId}...`,
 			async () => {
-				if (!isApiKeyCredential) {
-					await this.accountManager.refreshCredential(
-						status.provider,
-						selectedEntry.credential.credentialId,
-					);
-				}
+				const refreshResult = !isApiKeyCredential
+					? await this.accountManager.refreshCredential(
+							status.provider,
+							selectedEntry.credential.credentialId,
+						)
+					: null;
 				const usage = await this.accountManager.getCredentialUsageSnapshot(
 					status.provider,
 					selectedEntry.credential.credentialId,
@@ -1915,12 +1909,18 @@ class MultiAuthManagerModal {
 				);
 				await this.reloadStatuses(preserveSelection);
 				if (usage.error) {
-					return isApiKeyCredential
-						? `Credential checked for ${displayName}. Usage warning: ${usage.error}.`
+					if (isApiKeyCredential) {
+						return `Credential checked for ${displayName}. Usage warning: ${usage.error}.`;
+					}
+					return refreshResult?.disposition === "preserved_active_token"
+						? `Refresh endpoint failed for ${displayName}, but the current token is still active. Usage warning: ${usage.error}.`
 						: `Token refreshed for ${displayName}. Usage warning: ${usage.error}.`;
 				}
-				return isApiKeyCredential
-					? `Credential checked for ${displayName}.`
+				if (isApiKeyCredential) {
+					return `Credential checked for ${displayName}.`;
+				}
+				return refreshResult?.disposition === "preserved_active_token"
+					? `Refresh endpoint failed for ${displayName}, but the current token is still active and will continue to be used.`
 					: `Token refreshed for ${displayName}.`;
 			},
 		);
@@ -1947,11 +1947,19 @@ class MultiAuthManagerModal {
 			await this.reloadStatuses(preserveSelection);
 
 			const refreshedCount = result.refreshedCredentialIds.length;
+			const preservedCount = result.preservedCredentialIds.length;
 			const failedCount = result.failedCredentials.length;
 			const warningCount = result.usageWarnings.length;
-			const summary = `Refreshed ${refreshedCount}/${result.totalCredentials} account${result.totalCredentials === 1 ? "" : "s"} for ${status.provider}.`;
+			const processedCount = refreshedCount + preservedCount;
+			const summary = `Processed ${processedCount}/${result.totalCredentials} account${result.totalCredentials === 1 ? "" : "s"} for ${status.provider}.`;
 
 			const detailParts: string[] = [];
+			if (refreshedCount > 0) {
+				detailParts.push(`Refreshed: ${result.refreshedCredentialIds.join(", ")}`);
+			}
+			if (preservedCount > 0) {
+				detailParts.push(`Still using current token: ${result.preservedCredentialIds.join(", ")}`);
+			}
 			if (failedCount > 0) {
 				const failedIds = result.failedCredentials.map((item) => item.credentialId).join(", ");
 				detailParts.push(`Failed: ${failedIds}`);

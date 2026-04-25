@@ -1,7 +1,12 @@
 import { readFile, stat } from "node:fs/promises";
 import { getModels, type Api, type Model } from "@mariozechner/pi-ai";
 import { getOAuthProvider, getOAuthProviders } from "./oauth-compat.js";
+import { registerClineOAuthProvider } from "./oauth-cline.js";
 import { AuthWriter } from "./auth-writer.js";
+import {
+	resolveProviderRotationClassification,
+	type ProviderRotationProfile,
+} from "./provider-rotation-profile.js";
 import { resolveAgentRuntimePath } from "./runtime-paths.js";
 import {
 	LEGACY_SUPPORTED_PROVIDERS,
@@ -29,6 +34,8 @@ export interface ProviderCapabilities {
 	provider: SupportedProviderId;
 	supportsApiKey: boolean;
 	supportsOAuth: boolean;
+	hasExternalAccountState: boolean;
+	rotationProfile: ProviderRotationProfile;
 }
 
 export interface AvailableOAuthProvider {
@@ -39,6 +46,12 @@ export interface AvailableOAuthProvider {
 const EMPTY_MODELS_FILE: ModelsFileData = {
 	providers: {},
 };
+
+function ensureProviderOAuthRegistration(provider: SupportedProviderId): void {
+	if (provider === "cline" && !getOAuthProvider("cline")) {
+		registerClineOAuthProvider();
+	}
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -242,16 +255,24 @@ export class ProviderRegistry {
 	}
 
 	getProviderCapabilities(provider: SupportedProviderId): ProviderCapabilities {
+		ensureProviderOAuthRegistration(provider);
+		const supportsOAuth = Boolean(
+			getOAuthProvider(provider as Parameters<typeof getOAuthProvider>[0]),
+		);
+		const classification = resolveProviderRotationClassification(provider, {
+			supportsOAuth,
+		});
 		return {
 			provider,
 			supportsApiKey: true,
-			supportsOAuth: Boolean(
-				getOAuthProvider(provider as Parameters<typeof getOAuthProvider>[0]),
-			),
+			supportsOAuth,
+			hasExternalAccountState: classification.hasExternalAccountState,
+			rotationProfile: classification.rotationProfile,
 		};
 	}
 
 	listAvailableOAuthProviders(): AvailableOAuthProvider[] {
+		ensureProviderOAuthRegistration("cline");
 		const seenProviders = new Set<SupportedProviderId>();
 		const providers: AvailableOAuthProvider[] = [];
 		for (const provider of getOAuthProviders()) {
@@ -291,6 +312,7 @@ export class ProviderRegistry {
 			return false;
 		}
 
+		ensureProviderOAuthRegistration(provider);
 		const supportsOAuth = Boolean(
 			getOAuthProvider(provider as Parameters<typeof getOAuthProvider>[0]),
 		);

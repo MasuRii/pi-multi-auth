@@ -14,6 +14,7 @@ export interface OAuthRefreshConfig {
 	maxConcurrentRefreshes: number;
 	requestTimeoutMs: number;
 	enabled: boolean;
+	excludedProviders: string[];
 }
 
 export const DEFAULT_OAUTH_CONFIG: OAuthRefreshConfig = {
@@ -23,6 +24,7 @@ export const DEFAULT_OAUTH_CONFIG: OAuthRefreshConfig = {
 	maxConcurrentRefreshes: 3,
 	requestTimeoutMs: 15_000,
 	enabled: true,
+	excludedProviders: [],
 };
 
 export interface RefreshResult {
@@ -50,8 +52,7 @@ export interface OAuthRefreshFailureDetails {
 	credentialId?: string;
 	status?: number;
 	errorCode?: string;
-	errorDescription?: string;
-	responseBody?: string;
+	reason?: string;
 	permanent: boolean;
 	source: OAuthRefreshFailureSource;
 }
