@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.4.0 - 2026-04-27
+
+### Added
+- Added per-credential request overrides for provider base URLs and headers, including Cloudflare Workers AI account-scoped base URL validation and account discovery for Cloudflare API-key credentials.
+- Added provider response diagnostics for status-only OpenAI-compatible failures so authentication, permission, billing, and rate-limit errors can surface provider status codes, codes, messages, and operator actions.
+- Added persistent usage snapshot caching under Pi's runtime directory with display-only last-known entries for warm starts and degraded usage visibility.
+- Added coordinated usage refresh admission control with global and per-provider concurrency limits, operation-specific candidate windows, account/provider cooldowns, and circuit breakers.
+
+### Changed
+- Updated usage selection, blocked-account reconciliation, startup refinement, modal refresh, and manual refresh flows to share the persistent cache and usage coordinator instead of issuing unbounded fresh usage requests.
+- Centralized local development runners so lint emits a stable empty JSON result on success and compiled tests are discovered from `.test-dist/tests` automatically.
+- Updated package metadata and lockfile version to `0.4.0` for release preparation.
+
 ## 0.3.0 - 2026-04-25
 
 ### Added

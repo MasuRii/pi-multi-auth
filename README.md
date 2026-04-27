@@ -13,8 +13,11 @@
 
 - Wraps discovered Pi providers with multi-account rotation, quota-aware cooldowns, failover, health scoring, and optional pool selection.
 - Supports OAuth credential management for providers exposed by Pi and registers first-class Cline OAuth login and refresh handling.
+- Applies per-credential request overrides for provider base URLs and headers, with Cloudflare Workers AI credentials using account-scoped OpenAI-compatible base URLs.
+- Enriches status-only provider failures with bounded diagnostic probes so authentication, permission, billing, and rate-limit errors include actionable provider response details when available.
 - Provides lightweight rotation for API-key providers that do not expose external usage state, including delegated parent-session lease reuse.
-- Persists extension state under Pi's runtime directory while keeping local `config.json` and debug output outside the published package.
+- Persists extension state and usage snapshots under Pi's runtime directory while keeping local `config.json` and debug output outside the published package.
+- Coordinates fresh usage refreshes across selection, startup, modal, and manual refresh flows with bounded concurrency, candidate windows, cooldowns, and circuit breaking.
 
 ## Repository structure
 
@@ -73,8 +76,20 @@ Runtime configuration lives in `config.json` at the extension root. The extensio
 | `historyPersistence` | `object` | built-in defaults | Controls extracted health and cascade history file names under `debug/` |
 | `modelEntitlements` | `object` | built-in defaults | Controls provider-specific model entitlement behavior such as Codex usage lookup failures |
 | `oauthRefresh` | `object` | built-in defaults | Controls proactive OAuth token refresh scheduling, concurrency, and excluded providers |
+| `usageCoordination` | `object` | built-in defaults | Bounds fresh usage lookups with global/per-provider concurrency, operation-specific candidate windows, account/provider cooldowns, and circuit breakers |
 
-The published package intentionally excludes `config.json` and `debug/`; both are created locally as needed by the running extension.
+The published package intentionally excludes `config.json` and `debug/`; both are created locally as needed by the running extension. Usage snapshots are cached in Pi's runtime directory as `multi-auth-usage-cache.json` so operational and display-only usage state can survive extension restarts without publishing local state.
+
+### Credential request overrides
+
+Credentials may include a `request` object with provider-specific request settings:
+
+| Key | Type | Purpose |
+|-----|------|---------|
+| `request.baseUrl` | `string` | Overrides the model base URL for that credential after URL validation |
+| `request.headers` | `Record<string, string>` | Adds credential-scoped headers to the provider request |
+
+Cloudflare Workers AI credentials must use `https://api.cloudflare.com/client/v4/accounts/<account_id>/ai/v1` as the OpenAI-compatible base URL. When adding a Cloudflare API-key credential, the extension discovers this URL automatically if the token can list exactly one account; otherwise add `request.baseUrl` manually for the intended account.
 
 ## Validation
 

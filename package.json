@@ -1,6 +1,6 @@
 {
   "name": "pi-multi-auth",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Pi extension for multi-provider credential management, OAuth login, and account rotation.",
   "type": "module",
   "main": "./index.ts",
@@ -21,10 +21,10 @@
   "scripts": {
     "build": "npm run typecheck",
     "typecheck": "tsc -p tsconfig.json",
-    "lint": "npm run typecheck",
+    "lint": "node scripts/run-lint.mjs",
     "test:clean": "node -e \"require('node:fs').rmSync('.test-dist', { recursive: true, force: true })\"",
     "pretest": "npm run test:clean",
-    "test": "tsc -p tsconfig.test.json && node --test .test-dist/tests/responsive-modal.test.js .test-dist/tests/index-startup.test.js .test-dist/tests/runtime-paths.test.js .test-dist/tests/credential-entitlement.test.js .test-dist/tests/smart-add-provider.test.js .test-dist/tests/oauth-login-flow.test.js .test-dist/tests/cline-oauth.test.js .test-dist/tests/credential-request-secret.test.js .test-dist/tests/core-enhancements.test.js .test-dist/tests/lightweight-rotation.test.js",
+    "test": "tsc -p tsconfig.test.json && node scripts/run-compiled-tests.mjs",
     "posttest": "npm run test:clean",
     "check": "npm run typecheck && npm run test"
   },
