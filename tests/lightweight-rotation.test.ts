@@ -198,6 +198,111 @@ test("KeyDistributor bypasses delegated subagent acquisition when only one crede
 	}
 });
 
+test("KeyDistributor accepts delegated credential request objects and preserves positional acquisition", async () => {
+	const providerId = "custom-provider";
+	const credentialIds = [providerId, `${providerId}-1`] as const;
+	const tempDir = await mkdtemp(join(tmpdir(), "pi-multi-auth-delegated-request-"));
+	const storage = new MultiAuthStorage(join(tempDir, "multi-auth.json"), {
+		debugDir: join(tempDir, "debug"),
+	});
+	const authWriter = new AuthWriter(join(tempDir, "auth.json"));
+	const distributor = new KeyDistributor(storage, authWriter, {
+		waitTimeoutMs: 25,
+		maxConcurrentPerKey: 1,
+	});
+
+	try {
+		await authWriter.setApiKeyCredential(credentialIds[0], "request-object-key");
+		await authWriter.setApiKeyCredential(credentialIds[1], "positional-key");
+		await storage.withLock((state) => {
+			const providerState = getProviderState(state, providerId);
+			providerState.credentialIds = [...credentialIds];
+			providerState.rotationMode = "round-robin";
+			providerState.activeIndex = 0;
+			return { result: undefined, next: state };
+		});
+
+		const requestLease = await distributor.acquireForSubagent({
+			sessionId: "request-child",
+			providerId,
+			modelId: "model-a",
+			modelRef: `${providerId}/model-a`,
+			api: "openai-responses",
+			parentSessionId: "parent-a",
+		});
+		assert.equal(requestLease.credentialId, credentialIds[0]);
+		distributor.releaseFromSubagent("request-child");
+
+		const positionalLease = await distributor.acquireForSubagent("positional-child", providerId, {
+			modelId: "model-a",
+			parentSessionId: "parent-a",
+		});
+		assert.equal(positionalLease.credentialId, credentialIds[1]);
+	} finally {
+		await rm(tempDir, { recursive: true, force: true });
+	}
+});
+
+test("KeyDistributor exposes redacted delegated routing capabilities", async () => {
+	const providerId = "openai-codex";
+	const credentialIds = ["codex-free-credential", "codex-paid-credential"] as const;
+	const tempDir = await mkdtemp(join(tmpdir(), "pi-multi-auth-routing-capability-"));
+	const storage = new MultiAuthStorage(join(tempDir, "multi-auth.json"), {
+		debugDir: join(tempDir, "debug"),
+	});
+	const authWriter = new AuthWriter(join(tempDir, "auth.json"));
+	const distributor = new KeyDistributor(storage, authWriter, {
+		waitTimeoutMs: 25,
+		maxConcurrentPerKey: 1,
+	});
+
+	try {
+		distributor.setModelEligibilityResolver((currentProviderId, ids, modelId) => ({
+			appliesConstraint: currentProviderId === providerId && modelId === "gpt-5.4",
+			eligibleCredentialIds: ids.slice(1),
+			ineligibleCredentialIds: ids.slice(0, 1),
+			preferredCredentialIds: ids.slice(1),
+		}));
+		await authWriter.setApiKeyCredential(credentialIds[0], "free-plan-key");
+		await authWriter.setApiKeyCredential(credentialIds[1], "paid-plan-key");
+		await storage.withLock((state) => {
+			const providerState = getProviderState(state, providerId);
+			providerState.credentialIds = [...credentialIds];
+			providerState.rotationMode = "balancer";
+			providerState.activeIndex = 0;
+			return { result: undefined, next: state };
+		});
+
+		const capabilities = await distributor.getDelegatedCredentialRoutingCapabilities({
+			sessionId: "capability-child",
+			providerId,
+			modelId: "gpt-5.4",
+			modelRef: "openai-codex/gpt-5.4",
+			api: "openai-responses",
+		});
+
+		assert.deepEqual(capabilities, {
+			providerId,
+			modelId: "gpt-5.4",
+			modelRef: "openai-codex/gpt-5.4",
+			api: "openai-responses",
+			credentialCounts: {
+				total: 2,
+				structurallyEligible: 2,
+				modelEligible: 1,
+			},
+			modelConstraintApplied: true,
+			preferredCredentialCount: 1,
+			failureMessage: undefined,
+		});
+		const serializedCapabilities = JSON.stringify(capabilities);
+		assert.equal(serializedCapabilities.includes(credentialIds[0]), false);
+		assert.equal(serializedCapabilities.includes(credentialIds[1]), false);
+	} finally {
+		await rm(tempDir, { recursive: true, force: true });
+	}
+});
+
 test("KeyDistributor reuses lightweight parent-session leases and invalidates them on cooldown", async () => {
 	const providerId = "custom-provider";
 	const credentialIds = [providerId, `${providerId}-1`] as const;

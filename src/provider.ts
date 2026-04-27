@@ -22,7 +22,14 @@ import {
 	type CredentialErrorKind,
 } from "./error-classifier.js";
 import { buildClineClientHeaders } from "./cline-compat.js";
+import { describeCredentialErrorAction } from "./credential-error-formatting.js";
+import { applyCredentialRequestOverrides } from "./credential-request-overrides.js";
 import { multiAuthDebugLogger } from "./debug-logger.js";
+import {
+	enrichProviderStatusOnlyErrorMessage,
+	formatEnrichedProviderResponseBrief,
+	parseEnrichedProviderResponse,
+} from "./provider-error-details.js";
 import { ProviderRegistry } from "./provider-registry.js";
 import { resolveDelegatedCredentialOverride } from "./runtime-context.js";
 import type {
@@ -488,6 +495,72 @@ function createAbortedAssistantMessage(model: Model<Api>, message: string): Assi
 	};
 }
 
+interface RotationFailureDetails {
+	credentialCount?: number;
+	lastCredentialError?: string;
+	providerStatus?: number;
+	providerCode?: string;
+	providerMessage?: string;
+}
+
+function parseRotationFailureDetails(errorMessage: string): RotationFailureDetails {
+	const details: RotationFailureDetails = {};
+	const credentialCountMatch = /All\s+(\d+)\s+rotated credential\(s\)/i.exec(errorMessage);
+	if (credentialCountMatch?.[1]) {
+		details.credentialCount = Number.parseInt(credentialCountMatch[1], 10);
+	}
+
+	const lastCredentialErrorMatch = /Last credential error:\s*([^]*?)(?:;\s*provider response:|$)/i.exec(errorMessage);
+	if (lastCredentialErrorMatch?.[1]?.trim()) {
+		details.lastCredentialError = lastCredentialErrorMatch[1].trim();
+	}
+
+	const providerResponse = parseEnrichedProviderResponse(errorMessage);
+	details.providerStatus = providerResponse.status;
+	details.providerCode = providerResponse.code;
+	details.providerMessage = providerResponse.message;
+
+	return details;
+}
+
+function formatMultiAuthRotationFailureMessage(
+	providerId: SupportedProviderId,
+	model: Model<Api>,
+	errorMessage: string,
+): string {
+	if (/^All credentials are unavailable\b/i.test(errorMessage.trim())) {
+		return errorMessage;
+	}
+
+	const details = parseRotationFailureDetails(errorMessage);
+	const classifiedMessage = details.providerMessage ?? details.lastCredentialError ?? errorMessage;
+	const classification = classifyCredentialError(classifiedMessage, {
+		providerId,
+		modelId: model.id,
+	});
+	const reason =
+		formatEnrichedProviderResponseBrief({
+			status: details.providerStatus,
+			code: details.providerCode,
+			message: details.providerMessage,
+		}) ??
+		details.lastCredentialError ??
+		"Provider request failed after credential rotation was exhausted.";
+	const lines = [
+		"Multi-auth rotation failed",
+		`Provider: ${providerId}`,
+		`Model: ${model.id}`,
+	];
+	if (typeof details.credentialCount === "number" && Number.isFinite(details.credentialCount)) {
+		lines.push(`Credentials tried: ${details.credentialCount}`);
+	}
+	lines.push(
+		`Reason: ${reason}`,
+		`Action: ${describeCredentialErrorAction(classification.kind)}`,
+	);
+	return lines.join("\n");
+}
+
 function resolveCredentialProviderId(
 	model: Model<Api>,
 	fallbackProvider: SupportedProviderId,
@@ -529,7 +602,7 @@ export function createRotatingStreamWrapper(
 
 		(async () => {
 			let excludedCredentialIds = new Set<string>();
-			let lastRetryableMessage: string | null = null;
+			let lastCredentialErrorMessage: string | null = null;
 			let lastFailoverTrigger: CredentialErrorKind | null = null;
 			const selectionCache = createCredentialSelectionCache();
 			const bufferedThinkingState = createBufferedThinkingState();
@@ -585,7 +658,7 @@ export function createRotatingStreamWrapper(
 				};
 				activeBaseProvider = failoverBaseProvider;
 				excludedCredentialIds = new Set<string>();
-				lastRetryableMessage = null;
+				lastCredentialErrorMessage = null;
 				lastFailoverTrigger = null;
 				return true;
 			};
@@ -640,8 +713,8 @@ export function createRotatingStreamWrapper(
 						continue;
 					}
 					if (excludedCredentialIds.size > 0) {
-						const lastDetail = lastRetryableMessage
-							? ` Last retryable error: ${lastRetryableMessage}`
+						const lastDetail = lastCredentialErrorMessage
+							? ` Last credential error: ${lastCredentialErrorMessage}`
 							: ` Credential acquisition error: ${getErrorMessage(error, STRUCTURED_ERROR_MESSAGE_OPTIONS)}`;
 						throw new Error(
 							`All ${excludedCredentialIds.size} rotated credential(s) for ${activeProviderId} failed.${lastDetail}`,
@@ -651,13 +724,29 @@ export function createRotatingStreamWrapper(
 				}
 
 				const resolveRetryDecision = async (
-					message: string,
+					rawMessage: string,
 					hasForwardedSubstantiveEvent: boolean,
 					transientAttempt: number,
+					requestModel: Model<Api>,
+					requestHeaders: SimpleStreamOptions["headers"],
 				): Promise<"fail" | "retry_same_credential" | "rotate_credential"> => {
+					const message = await enrichProviderStatusOnlyErrorMessage(rawMessage, {
+						model: requestModel,
+						apiKey: selected.secret,
+						headers: requestHeaders,
+						signal: options?.signal,
+					});
+					if (message !== rawMessage) {
+						multiAuthDebugLogger.log("provider_error_body_enriched", {
+							provider: activeProviderId,
+							credentialId: selected.credentialId,
+							model: requestModel.id,
+							errorMessage: message.slice(0, 200),
+						});
+					}
 					const classification = classifyCredentialError(message, {
 						providerId: activeProviderId,
-						modelId: activeModel.id,
+						modelId: requestModel.id,
 					});
 					multiAuthDebugLogger.log("error_classified", {
 						provider: activeProviderId,
@@ -699,7 +788,7 @@ export function createRotatingStreamWrapper(
 						classification.shouldRetrySameCredential &&
 						transientAttempt < MAX_TRANSIENT_RETRIES_PER_CREDENTIAL
 					) {
-						lastRetryableMessage = message;
+						lastCredentialErrorMessage = message;
 						return "retry_same_credential";
 					}
 
@@ -709,7 +798,7 @@ export function createRotatingStreamWrapper(
 						!hasForwardedSubstantiveEvent &&
 						attempt < MAX_ROTATION_RETRIES
 					) {
-						lastRetryableMessage = message;
+						lastCredentialErrorMessage = message;
 						if (useDelegatedCredentialOverride) {
 							return "fail";
 						}
@@ -732,7 +821,7 @@ export function createRotatingStreamWrapper(
 						classification.shouldRotateCredential &&
 						attempt < MAX_ROTATION_RETRIES
 					) {
-						lastRetryableMessage = message;
+						lastCredentialErrorMessage = message;
 						if (useDelegatedCredentialOverride) {
 							return "fail";
 						}
@@ -780,6 +869,20 @@ export function createRotatingStreamWrapper(
 				) {
 					resetBufferedThinkingState(bufferedThinkingState);
 					const requestStartedAt = Date.now();
+					const providerRequestHeaders = resolveProviderRequestHeaders(
+						activeProviderId,
+						options?.headers,
+					);
+					const {
+						model: requestModel,
+						headers: requestHeaders,
+					} = applyCredentialRequestOverrides({
+						provider: activeProviderId,
+						credentialId: selected.credentialId,
+						credential: selected.credential,
+						model: activeModel,
+						headers: providerRequestHeaders,
+					});
 					let innerStream: AssistantMessageEventStream;
 					try {
 						multiAuthDebugLogger.log("stream_request_auth", {
@@ -790,14 +893,14 @@ export function createRotatingStreamWrapper(
 								: selected.credential?.type ?? "unknown",
 							secretPrefix: selected.secret.slice(0, 12),
 							secretStartsWithWorkos: selected.secret.startsWith("workos:"),
-							model: activeModel.id,
-							baseUrl: activeModel.baseUrl,
-							api: activeModel.api,
+							model: requestModel.id,
+							baseUrl: requestModel.baseUrl,
+							api: requestModel.api,
 						});
-						innerStream = activeBaseProvider.streamSimple(activeModel, context, {
+						innerStream = activeBaseProvider.streamSimple(requestModel, context, {
 							...options,
 							apiKey: selected.secret,
-							headers: resolveProviderRequestHeaders(activeProviderId, options?.headers),
+							headers: requestHeaders,
 							signal: options?.signal,
 						});
 					} catch (error: unknown) {
@@ -810,6 +913,8 @@ export function createRotatingStreamWrapper(
 							message,
 							false,
 							transientAttempt,
+							requestModel,
+							requestHeaders,
 						);
 						if (decision === "retry_same_credential") {
 							continue;
@@ -845,6 +950,8 @@ export function createRotatingStreamWrapper(
 										message,
 										hasForwardedSubstantiveEvent,
 										transientAttempt,
+										requestModel,
+										requestHeaders,
 									);
 									if (decision === "retry_same_credential") {
 										shouldRetrySameCredential = true;
@@ -885,6 +992,8 @@ export function createRotatingStreamWrapper(
 										message,
 										hasForwardedSubstantiveEvent,
 										transientAttempt,
+										requestModel,
+										requestHeaders,
 									);
 									if (decision === "retry_same_credential") {
 										shouldRetrySameCredential = true;
@@ -926,6 +1035,8 @@ export function createRotatingStreamWrapper(
 							message,
 							hasForwardedSubstantiveEvent,
 							transientAttempt,
+							requestModel,
+							requestHeaders,
 						);
 						if (decision === "retry_same_credential") {
 							shouldRetrySameCredential = true;
@@ -956,6 +1067,8 @@ export function createRotatingStreamWrapper(
 							message,
 							hasForwardedSubstantiveEvent,
 							transientAttempt,
+							requestModel,
+							requestHeaders,
 						);
 						if (decision === "retry_same_credential") {
 							continue;
@@ -972,19 +1085,20 @@ export function createRotatingStreamWrapper(
 			}
 
 			const triedCount = excludedCredentialIds.size;
-			const lastDetail = lastRetryableMessage
-				? ` Last error: ${lastRetryableMessage}`
+			const lastDetail = lastCredentialErrorMessage
+				? ` Last error: ${lastCredentialErrorMessage}`
 				: "";
 			throw new Error(
 				`Rotation exhausted for ${activeProviderId}: ${triedCount} credential(s) tried across ${MAX_ROTATION_RETRIES + 1} attempts, all appear quota-limited or rate-limited.${lastDetail}`,
 			);
 		})().catch((error: unknown) => {
+			const errorMessage = getErrorMessage(error, STRUCTURED_ERROR_MESSAGE_OPTIONS);
 			const assistantError: AssistantMessageEvent = {
 				type: "error",
 				reason: "error",
 				error: createErrorAssistantMessage(
 					activeModel,
-					`multi-auth rotation failed for ${activeProviderId}: ${getErrorMessage(error, STRUCTURED_ERROR_MESSAGE_OPTIONS)}`,
+					formatMultiAuthRotationFailureMessage(activeProviderId, activeModel, errorMessage),
 				),
 			};
 			stream.push(assistantError);

@@ -1,4 +1,5 @@
 import type { ParsedRateLimitHeaders, QuotaClassification } from "../types-quota.js";
+import type { UsageCoordinationOperation } from "./usage-coordinator.js";
 
 /**
  * Shared usage/quota types used by provider fetchers and UI rendering.
@@ -95,4 +96,5 @@ export interface UsageFetchOptions {
 	allowStale?: boolean;
 	maxAgeMs?: number;
 	signal?: AbortSignal;
+	coordinationOperation?: UsageCoordinationOperation;
 }

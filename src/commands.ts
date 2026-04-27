@@ -81,6 +81,12 @@ type SelectionAnchor =
 		kind: "add";
 	};
 
+type CredentialUsageDisplayState = {
+	usageSnapshot: CredentialStatus["usageSnapshot"];
+	usageFetchError?: string;
+	usageSnapshotDisplayOnly?: boolean;
+};
+
 const THREE_PANE_MIN_WIDTH = 96;
 const GRID_BODY_ROW_COUNT = 22;
 const MIN_BODY_ROW_COUNT = 4;
@@ -88,7 +94,25 @@ const GRID_CELL_HORIZONTAL_PADDING = 2;
 const GRID_VERTICAL_SEPARATOR_COLUMNS = 2;
 const MODAL_TITLE_LEFT_MARGIN = 2;
 const MODAL_TITLE_BOTTOM_MARGIN_ROWS = 1;
-const MODAL_USAGE_CACHE_MAX_AGE_MS = 5 * 60_000;
+export type ModalRefreshAction = "none" | "provider" | "selected-account";
+
+export function resolveModalRefreshAction(
+	data: string,
+	focusedPane: FocusPane,
+	selectedEntryKind: SelectedEntryKind,
+): ModalRefreshAction {
+	if (data === "T" || matchesKey(data, "shift+t")) {
+		return selectedEntryKind === "account" ? "selected-account" : "none";
+	}
+
+	if (data === "t" || matchesKey(data, "t")) {
+		return focusedPane === "accounts" && selectedEntryKind === "account"
+			? "selected-account"
+			: "provider";
+	}
+
+	return "none";
+}
 const BORDER_GLYPHS = resolveBorderGlyphs();
 export const CUSTOM_PROVIDER_NAME_OPTION = "__custom_provider__" as const;
 
@@ -310,6 +334,29 @@ export function wrapAccountDisplayNameLines(displayName: string, maxWidth: numbe
 	}
 	const wrapped = wrapTextToWidth(normalized, safeWidth);
 	return wrapped.length > 0 ? wrapped : [normalized];
+}
+
+function wrapDetailMessageLines(message: string, maxWidth: number): string[] {
+	const safeWidth = Math.max(1, Math.floor(maxWidth));
+	const normalized = normalizeInlineText(message).trim();
+	if (!normalized) {
+		return [];
+	}
+	const wrapped = wrapTextToWidth(normalized, safeWidth);
+	return wrapped.length > 0 ? wrapped : [normalized];
+}
+
+function buildUsageUnavailableLines(error: string | undefined, maxWidth: number): string[] {
+	const normalizedError = normalizeInlineText(error ?? "").trim();
+	if (!normalizedError) {
+		return ["Usage unavailable"];
+	}
+
+	const lowerError = normalizedError.toLowerCase();
+	const message = lowerError.startsWith("usage unavailable")
+		? normalizedError
+		: `Usage unavailable (${normalizedError})`;
+	return wrapDetailMessageLines(message, maxWidth);
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -608,6 +655,43 @@ function createEmptyProviderStatus(provider: SupportedProviderId): ProviderStatu
 	};
 }
 
+interface CachedUsageDisplayReader {
+	getCachedCredentialUsageDisplaySnapshot(
+		provider: SupportedProviderId,
+		credentialId: string,
+	): {
+		snapshot: CredentialStatus["usageSnapshot"];
+		error: string | null;
+		displayOnly?: boolean;
+	} | null;
+}
+
+export function hydrateStatusWithCachedUsage(
+	accountManager: CachedUsageDisplayReader,
+	status: ProviderStatus,
+): ProviderStatus {
+	let hasCachedUsage = false;
+	const credentials = status.credentials.map((credential) => {
+		const usage = accountManager.getCachedCredentialUsageDisplaySnapshot(
+			status.provider,
+			credential.credentialId,
+		);
+		if (!usage) {
+			return credential;
+		}
+
+		hasCachedUsage = true;
+		return {
+			...credential,
+			usageSnapshot: usage.snapshot,
+			usageSnapshotDisplayOnly: usage.displayOnly,
+			usageFetchError: usage.error ?? undefined,
+		};
+	});
+
+	return hasCachedUsage ? { ...status, credentials } : status;
+}
+
 async function loadAllProviderStatuses(accountManager: AccountManager): Promise<ProviderStatus[]> {
 	const providers = await accountManager.getSupportedProviders();
 	const settled = await Promise.allSettled(
@@ -617,7 +701,7 @@ async function loadAllProviderStatuses(accountManager: AccountManager): Promise<
 	return settled.map((result, index) => {
 		const provider = providers[index];
 		if (result?.status === "fulfilled") {
-			return result.value;
+			return hydrateStatusWithCachedUsage(accountManager, result.value);
 		}
 		return createEmptyProviderStatus(provider);
 	});
@@ -856,12 +940,16 @@ class MultiAuthManagerModal {
 			return;
 		}
 
-		if (matchesKey(data, "shift+t")) {
+		const refreshAction = resolveModalRefreshAction(
+			data,
+			this.focusedPane,
+			this.getSelectedEntryKind(this.getSelectedProviderStatus()),
+		);
+		if (refreshAction === "selected-account") {
 			this.refreshSelectedAccount();
 			return;
 		}
-
-		if (matchesKey(data, "t")) {
+		if (refreshAction === "provider") {
 			this.refreshSelectedProviderAccounts();
 			return;
 		}
@@ -1130,6 +1218,9 @@ class MultiAuthManagerModal {
 		const batchSelectionCount = this.getBatchSelectedCredentialIds(status).length;
 		const state = this.getCredentialState(selectedCredential);
 		const planType = selectedCredential.usageSnapshot?.planType ?? "unknown";
+		const planLabel = selectedCredential.usageSnapshotDisplayOnly
+			? `${planType} (last known)`
+			: planType;
 		const selectionMode = selectedCredential.isManualActive
 			? "Manual active (persists across sessions/restarts)"
 			: "Automatic";
@@ -1138,7 +1229,7 @@ class MultiAuthManagerModal {
 			`ID:        ${selectedCredential.credentialId}`,
 			`Type:      ${selectedCredential.credentialType}`,
 			`Auth:      ${selectedCredential.redactedSecret}`,
-			`Plan:      ${planType}`,
+			`Plan:      ${planLabel}`,
 			`State:     ${state.label}`,
 			`Selection: ${selectionMode}`,
 			`Marked:    ${this.isCredentialBatchSelected(status.provider, selectedCredential.credentialId) ? "Batch delete queue" : "No"}`,
@@ -1209,14 +1300,15 @@ class MultiAuthManagerModal {
 		const snapshot = credential.usageSnapshot;
 		if (!snapshot) {
 			if (credential.usageFetchError) {
-				return ["Usage unavailable", credential.usageFetchError];
+				return buildUsageUnavailableLines(credential.usageFetchError, detailWidth);
 			}
 			return ["Loading usage data..."];
 		}
 
 		const barWidth = clamp(Math.floor(detailWidth * 0.45), 10, 26);
+		const lastKnownPrefix = credential.usageSnapshotDisplayOnly ? ["Last known usage data."] : [];
 		if (snapshot.copilotQuota) {
-			const lines: string[] = [];
+			const lines: string[] = [...lastKnownPrefix];
 			const chat = snapshot.copilotQuota.chat;
 			lines.push("Chat Completions");
 			lines.push(renderProgressBar(chat.percentUsed, barWidth));
@@ -1245,7 +1337,7 @@ class MultiAuthManagerModal {
 			return lines;
 		}
 
-		const lines: string[] = [];
+		const lines: string[] = [...lastKnownPrefix];
 		if (snapshot.primary) {
 			lines.push(resolveUsageWindowLabel(snapshot, "primary"));
 			lines.push(renderProgressBar(snapshot.primary.usedPercent, barWidth));
@@ -1265,7 +1357,7 @@ class MultiAuthManagerModal {
 				lines.push(`Resets in ${reset}`);
 			}
 		}
-		if (lines.length === 0) {
+		if (lines.length === lastKnownPrefix.length) {
 			lines.push("Usage unavailable");
 		}
 		return lines;
@@ -1905,7 +1997,10 @@ class MultiAuthManagerModal {
 				const usage = await this.accountManager.getCredentialUsageSnapshot(
 					status.provider,
 					selectedEntry.credential.credentialId,
-					{ forceRefresh: true },
+					{
+						forceRefresh: true,
+						coordinationOperation: "manual-account-refresh",
+					},
 				);
 				await this.reloadStatuses(preserveSelection);
 				if (usage.error) {
@@ -2013,22 +2108,22 @@ class MultiAuthManagerModal {
 	private async refreshUsageSnapshots(): Promise<void> {
 		const refreshEpoch = ++this.usageRefreshEpoch;
 		const preserveSelection = this.getCurrentSelectionAnchor();
-		const usageByCredentialKey = new Map<
-			string,
-			{ usageSnapshot: CredentialStatus["usageSnapshot"]; usageFetchError?: string }
-		>();
+		const usageByCredentialKey = new Map<string, CredentialUsageDisplayState>();
 		const credentials = this.statuses.flatMap((status) =>
 			status.credentials.map((credential) => ({
 				provider: status.provider,
 				credentialId: credential.credentialId,
 			})),
 		);
-		const refreshCandidates: Array<{ provider: SupportedProviderId; credentialId: string }> = [];
+		const refreshCandidates = this.accountManager.selectUsageRefreshCandidates(
+			credentials,
+			"modal-refresh",
+		);
 
 		const applyUsageState = (
 			provider: SupportedProviderId,
 			credentialId: string,
-			usageState: { usageSnapshot: CredentialStatus["usageSnapshot"]; usageFetchError?: string },
+			usageState: CredentialUsageDisplayState,
 		): void => {
 			usageByCredentialKey.set(this.getCredentialMapKey(provider, credentialId), usageState);
 			if (refreshEpoch !== this.usageRefreshEpoch) {
@@ -2037,45 +2132,43 @@ class MultiAuthManagerModal {
 			this.setCredentialUsageState(provider, credentialId, usageState);
 		};
 
-		const cacheTasks = credentials.map(async ({ provider, credentialId }) => {
-			try {
-				const usage = await this.accountManager.getCredentialUsageSnapshot(provider, credentialId, {
-					allowStale: true,
-					maxAgeMs: MODAL_USAGE_CACHE_MAX_AGE_MS,
-				});
-				applyUsageState(provider, credentialId, {
-					usageSnapshot: usage.snapshot,
-					usageFetchError: usage.error ?? undefined,
-				});
-				if (usage.fromCache) {
-					refreshCandidates.push({ provider, credentialId });
-				}
-			} catch (error: unknown) {
-				applyUsageState(provider, credentialId, {
-					usageSnapshot: null,
-					usageFetchError: `Usage unavailable (${getErrorMessage(error)})`,
-				});
+		for (const { provider, credentialId } of credentials) {
+			const usage = this.accountManager.getCachedCredentialUsageDisplaySnapshot(provider, credentialId);
+			if (!usage) {
+				continue;
 			}
-		});
-
-		await Promise.allSettled(cacheTasks);
+			applyUsageState(provider, credentialId, {
+				usageSnapshot: usage.snapshot,
+				usageFetchError: usage.error ?? undefined,
+				usageSnapshotDisplayOnly: usage.displayOnly,
+			});
+		}
 		if (refreshEpoch !== this.usageRefreshEpoch) {
 			return;
 		}
 
 		const freshTasks = refreshCandidates.map(async ({ provider, credentialId }) => {
+			const credentialKey = this.getCredentialMapKey(provider, credentialId);
 			try {
 				const usage = await this.accountManager.getCredentialUsageSnapshot(provider, credentialId, {
 					forceRefresh: true,
+					coordinationOperation: "modal-refresh",
 				});
+				const previousUsageState = usageByCredentialKey.get(credentialKey);
+				const hasFreshSnapshot = usage.snapshot !== null;
 				applyUsageState(provider, credentialId, {
-					usageSnapshot: usage.snapshot,
-					usageFetchError: usage.error ?? undefined,
+					usageSnapshot: usage.snapshot ?? previousUsageState?.usageSnapshot ?? null,
+					usageFetchError: usage.error ?? previousUsageState?.usageFetchError,
+					usageSnapshotDisplayOnly: hasFreshSnapshot
+						? usage.displayOnly
+						: previousUsageState?.usageSnapshotDisplayOnly,
 				});
 			} catch (error: unknown) {
+				const previousUsageState = usageByCredentialKey.get(credentialKey);
 				applyUsageState(provider, credentialId, {
-					usageSnapshot: null,
+					usageSnapshot: previousUsageState?.usageSnapshot ?? null,
 					usageFetchError: `Usage unavailable (${getErrorMessage(error)})`,
+					usageSnapshotDisplayOnly: previousUsageState?.usageSnapshotDisplayOnly,
 				});
 			}
 		});
@@ -2099,7 +2192,7 @@ class MultiAuthManagerModal {
 	private setCredentialUsageState(
 		provider: SupportedProviderId,
 		credentialId: string,
-		usageState: { usageSnapshot: CredentialStatus["usageSnapshot"]; usageFetchError?: string },
+		usageState: CredentialUsageDisplayState,
 	): void {
 		let updated = false;
 		this.statuses = this.statuses.map((status) => {
@@ -2116,6 +2209,7 @@ class MultiAuthManagerModal {
 				return {
 					...credential,
 					usageSnapshot: usageState.usageSnapshot,
+					usageSnapshotDisplayOnly: usageState.usageSnapshotDisplayOnly,
 					usageFetchError: usageState.usageFetchError,
 				};
 			});
@@ -2138,10 +2232,7 @@ class MultiAuthManagerModal {
 
 	private mergeStatusesWithUsage(
 		statuses: ProviderStatus[],
-		usageByCredentialKey: Map<
-			string,
-			{ usageSnapshot: CredentialStatus["usageSnapshot"]; usageFetchError?: string }
-		>,
+		usageByCredentialKey: Map<string, CredentialUsageDisplayState>,
 	): ProviderStatus[] {
 		return statuses.map((status) => ({
 			...status,
@@ -2155,6 +2246,7 @@ class MultiAuthManagerModal {
 				return {
 					...credential,
 					usageSnapshot: usageState.usageSnapshot,
+					usageSnapshotDisplayOnly: usageState.usageSnapshotDisplayOnly,
 					usageFetchError: usageState.usageFetchError,
 				};
 			}),

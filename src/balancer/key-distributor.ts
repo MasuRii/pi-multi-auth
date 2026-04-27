@@ -14,6 +14,8 @@ import type {
 	BalancerCredentialState,
 	CooldownInfo,
 	CredentialLease,
+	DelegatedCredentialRequest,
+	DelegatedRoutingCapabilities,
 	KeyDistributorMetrics,
 	KeyDistributorProviderMetrics,
 	SelectionContext,
@@ -43,9 +45,12 @@ type KeyDistributorConfig = {
 };
 
 type AcquireWaitOptions = {
+	timeoutMs?: number;
 	signal?: AbortSignal;
 	excludedIds?: readonly string[];
 	modelId?: string;
+	modelRef?: string;
+	api?: string;
 	parentSessionId?: string;
 };
 
@@ -142,27 +147,40 @@ export class KeyDistributor {
 	 * Acquires an exclusive credential lease for one subagent session.
 	 */
 	async acquireForSubagent(
+		request: DelegatedCredentialRequest,
+	): Promise<{ credentialId: string; apiKey: string }>;
+	async acquireForSubagent(
 		sessionId: string,
 		providerId: SupportedProviderId,
+		options?: AcquireWaitOptions,
+	): Promise<{ credentialId: string; apiKey: string }>;
+	async acquireForSubagent(
+		sessionIdOrRequest: string | DelegatedCredentialRequest,
+		providerId?: SupportedProviderId,
 		options: AcquireWaitOptions = {},
 	): Promise<{ credentialId: string; apiKey: string }> {
-		const startedAt = Date.now();
-		const providerMetrics = this.getOrCreateProviderMetrics(providerId);
-		providerMetrics.acquisitionCount += 1;
-		const normalizedSessionId = normalizeSessionId(sessionId);
-		const normalizedParentSessionId = normalizeOptionalSessionId(options.parentSessionId);
-		const lightweightLeaseScopeKey = this.getLightweightLeaseScopeKey(
+		const request = normalizeDelegatedCredentialRequest(
+			sessionIdOrRequest,
 			providerId,
+			options,
+		);
+		const startedAt = Date.now();
+		const providerMetrics = this.getOrCreateProviderMetrics(request.providerId);
+		providerMetrics.acquisitionCount += 1;
+		const normalizedSessionId = normalizeSessionId(request.sessionId);
+		const normalizedParentSessionId = normalizeOptionalSessionId(request.parentSessionId);
+		const lightweightLeaseScopeKey = this.getLightweightLeaseScopeKey(
+			request.providerId,
 			normalizedParentSessionId,
 		);
 		const effectiveLeaseSessionId = lightweightLeaseScopeKey ?? normalizedSessionId;
 		const isLightweightSessionLease = effectiveLeaseSessionId === lightweightLeaseScopeKey;
 
 		try {
-			const resolvedLease = await this.withProviderAcquireLock(providerId, async () => {
-				assertNotAborted(options.signal, providerId);
+			const resolvedLease = await this.withProviderAcquireLock(request.providerId, async () => {
+				assertNotAborted(request.signal, request.providerId);
 				const existingLease = this.getActiveLeaseForSession(normalizedSessionId);
-				if (existingLease && existingLease.providerId === providerId) {
+				if (existingLease && existingLease.providerId === request.providerId) {
 					if (!(options.excludedIds ?? []).includes(existingLease.credentialId)) {
 						this.refreshLeaseExpiration(existingLease, lightweightLeaseScopeKey !== undefined);
 						return this.resolveActiveLease(existingLease);
@@ -172,7 +190,7 @@ export class KeyDistributor {
 
 				if (lightweightLeaseScopeKey && normalizedParentSessionId) {
 					const existingLightweightLease = this.getActiveLeaseForSession(lightweightLeaseScopeKey);
-					if (existingLightweightLease && existingLightweightLease.providerId === providerId) {
+					if (existingLightweightLease && existingLightweightLease.providerId === request.providerId) {
 						if (!(options.excludedIds ?? []).includes(existingLightweightLease.credentialId)) {
 							this.registerLightweightLeaseAssociation(
 								normalizedSessionId,
@@ -188,18 +206,18 @@ export class KeyDistributor {
 
 				const credentialId = await this.acquireCredentialId(
 					{
-						providerId,
+						providerId: request.providerId,
 						excludedIds: [...(options.excludedIds ?? [])],
 						requestingSessionId: effectiveLeaseSessionId,
-						modelId: options.modelId,
+						modelId: request.modelId,
 					},
-					options.signal,
+					request.signal,
 				);
-				assertNotAborted(options.signal, providerId);
+				assertNotAborted(request.signal, request.providerId);
 				const acquiredAt = Date.now();
 				const lease: InternalLease = {
 					sessionId: effectiveLeaseSessionId,
-					providerId,
+					providerId: request.providerId,
 					credentialId,
 					acquiredAt,
 					expiresAt:
@@ -217,20 +235,20 @@ export class KeyDistributor {
 				}
 				return this.resolveActiveLease(lease);
 			});
-			this.recordAcquireSuccess(providerId, Date.now() - startedAt);
+			this.recordAcquireSuccess(request.providerId, Date.now() - startedAt);
 			return resolvedLease;
 		} catch (error) {
 			if (isAbortError(error)) {
 				this.unregisterLease(effectiveLeaseSessionId);
 			}
-			this.recordAcquireFailure(providerId, Date.now() - startedAt, error, options.signal);
+			this.recordAcquireFailure(request.providerId, Date.now() - startedAt, error, request.signal);
 			throw error;
 		}
 	}
 
 	async shouldBypassDelegatedSubagentAcquisition(
 		providerId: SupportedProviderId,
-		options: { modelId?: string; signal?: AbortSignal } = {},
+		options: { modelId?: string; modelRef?: string; api?: string; signal?: AbortSignal } = {},
 	): Promise<boolean> {
 		assertNotAborted(options.signal, providerId);
 		await this.clearExpiredCooldowns();
@@ -661,6 +679,64 @@ export class KeyDistributor {
 			};
 		}
 		return { providers };
+	}
+
+	async getDelegatedCredentialRoutingCapabilities(
+		request: DelegatedCredentialRequest,
+	): Promise<DelegatedRoutingCapabilities> {
+		const normalizedRequest = normalizeDelegatedCredentialRequest(request, undefined, {});
+		assertNotAborted(normalizedRequest.signal, normalizedRequest.providerId);
+		await this.clearExpiredCooldowns();
+		const now = Date.now();
+		const snapshot = await this.buildSnapshot(normalizedRequest.providerId, now);
+		assertNotAborted(normalizedRequest.signal, normalizedRequest.providerId);
+		const selectionContext: SelectionContext = {
+			providerId: normalizedRequest.providerId,
+			excludedIds: [],
+			requestingSessionId: normalizedRequest.sessionId,
+			modelId: normalizedRequest.modelId,
+		};
+		const structurallyEligibleCredentialIds = await this.getStructurallyEligibleCredentialIds(
+			normalizedRequest.providerId,
+			selectionContext,
+			snapshot,
+			now,
+			normalizedRequest.signal,
+		);
+
+		let modelEligibleCredentialCount = structurallyEligibleCredentialIds.length;
+		let modelConstraintApplied = false;
+		let preferredCredentialCount: number | undefined;
+		let failureMessage: string | undefined;
+		if (normalizedRequest.modelId && this.modelEligibilityResolver) {
+			const eligibility = await this.modelEligibilityResolver(
+				normalizedRequest.providerId,
+				structurallyEligibleCredentialIds,
+				normalizedRequest.modelId,
+				normalizedRequest.signal,
+			);
+			modelConstraintApplied = eligibility.appliesConstraint;
+			if (eligibility.appliesConstraint) {
+				modelEligibleCredentialCount = eligibility.eligibleCredentialIds.length;
+				preferredCredentialCount = eligibility.preferredCredentialIds?.length;
+				failureMessage = eligibility.failureMessage;
+			}
+		}
+
+		return {
+			providerId: normalizedRequest.providerId,
+			modelId: normalizedRequest.modelId,
+			modelRef: normalizedRequest.modelRef,
+			api: normalizedRequest.api,
+			credentialCounts: {
+				total: snapshot.credentialIds.length,
+				structurallyEligible: structurallyEligibleCredentialIds.length,
+				modelEligible: modelEligibleCredentialCount,
+			},
+			modelConstraintApplied,
+			preferredCredentialCount,
+			failureMessage,
+		};
 	}
 
 	private isLightweightRotationProvider(providerId: SupportedProviderId): boolean {
@@ -1510,6 +1586,55 @@ export class KeyDistributor {
 		this.waitersByProvider.set(providerId, created);
 		return created;
 	}
+}
+
+function normalizeProviderId(providerId: SupportedProviderId): SupportedProviderId {
+	const normalized = providerId.trim().toLowerCase();
+	if (normalized.length === 0) {
+		throw new Error("providerId must be a non-empty string.");
+	}
+	return normalized;
+}
+
+function normalizeOptionalString(value: string | undefined): string | undefined {
+	if (typeof value !== "string") {
+		return undefined;
+	}
+	const normalized = value.trim();
+	return normalized.length > 0 ? normalized : undefined;
+}
+
+function normalizeDelegatedCredentialRequest(
+	sessionIdOrRequest: string | DelegatedCredentialRequest,
+	providerId: SupportedProviderId | undefined,
+	options: AcquireWaitOptions,
+): DelegatedCredentialRequest {
+	if (typeof sessionIdOrRequest !== "string") {
+		return {
+			...sessionIdOrRequest,
+			sessionId: normalizeSessionId(sessionIdOrRequest.sessionId),
+			providerId: normalizeProviderId(sessionIdOrRequest.providerId),
+			modelId: normalizeOptionalString(sessionIdOrRequest.modelId),
+			modelRef: normalizeOptionalString(sessionIdOrRequest.modelRef),
+			api: normalizeOptionalString(sessionIdOrRequest.api),
+			parentSessionId: normalizeOptionalSessionId(sessionIdOrRequest.parentSessionId),
+		};
+	}
+
+	if (!providerId) {
+		throw new Error("providerId must be provided when acquiring a delegated credential by session ID.");
+	}
+
+	return {
+		sessionId: normalizeSessionId(sessionIdOrRequest),
+		providerId: normalizeProviderId(providerId),
+		timeoutMs: options.timeoutMs,
+		modelId: normalizeOptionalString(options.modelId),
+		modelRef: normalizeOptionalString(options.modelRef),
+		api: normalizeOptionalString(options.api),
+		parentSessionId: normalizeOptionalSessionId(options.parentSessionId),
+		signal: options.signal,
+	};
 }
 
 function trimRecordByKeys<T>(record: Record<string, T>, keys: Set<string>): void {

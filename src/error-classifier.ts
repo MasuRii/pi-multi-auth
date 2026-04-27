@@ -125,6 +125,8 @@ const BALANCE_EXHAUSTED_PATTERNS: RegExp[] = [
 	/outstanding[_\s-]?balance/i,
 	/balance[_\s-]?too[_\s-]?low/i,
 	/insufficient[_\s-]?balance/i,
+	/account[^\n.]*balance[^\n.]*insufficient/i,
+	/balance[^\n.]*insufficient/i,
 	/no[_\s-]?credits?[_\s-]?(?:remaining|left)/i,
 	/account[_\s-]?has[_\s-]?no[_\s-]?credits/i,
 	/credits?[_\s-]?depleted/i,

@@ -148,9 +148,6 @@ export function resolveFooterActions(options: FooterActionOptions): string[] {
 			}
 		}
 
-		if (options.hasProviderCredentials) {
-			actions.push("[t] Refresh Provider");
-		}
 	}
 
 	appendCommonActions();

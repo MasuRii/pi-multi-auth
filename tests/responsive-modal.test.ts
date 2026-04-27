@@ -18,6 +18,8 @@ import {
 	summarizeProviderVisibility,
 } from "../src/formatters/modal-ui.js";
 import { formatRotationModeLabel } from "../src/rotation-modes.js";
+import { hydrateStatusWithCachedUsage, resolveModalRefreshAction } from "../src/commands.js";
+import type { ProviderStatus, SupportedProviderId } from "../src/types.js";
 
 const PROVIDER_FOOTER_ACTIONS = resolveFooterActions({
 	focusedPane: "providers",
@@ -72,7 +74,6 @@ test("account footer actions only show account-scoped actions", () => {
 		"[r] Rename",
 		"[T] Refresh Selected",
 		"[d] Delete",
-		"[t] Refresh Provider",
 		"[v] Show Hidden/Empty",
 		"[←/→] Pane",
 		"[Esc] Close",
@@ -95,7 +96,14 @@ test("account add row footer avoids duplicate add shortcut", () => {
 		selectedAccountMarked: false,
 	});
 
-	assert.deepEqual(actions, ["[Enter] Add", "[t] Refresh Provider", "[←/→] Pane", "[Esc] Close"]);
+	assert.deepEqual(actions, ["[Enter] Add", "[←/→] Pane", "[Esc] Close"]);
+});
+
+test("modal refresh key resolution keeps account-pane refresh targeted", () => {
+	assert.equal(resolveModalRefreshAction("T", "accounts", "account"), "selected-account");
+	assert.equal(resolveModalRefreshAction("t", "accounts", "account"), "selected-account");
+	assert.equal(resolveModalRefreshAction("t", "providers", "account"), "provider");
+	assert.equal(resolveModalRefreshAction("T", "accounts", "add"), "none");
 });
 
 test("rename mode footer collapses to save and cancel", () => {
@@ -342,6 +350,54 @@ test("provider add row footer surfaces enter-based add action", () => {
 	});
 
 	assert.deepEqual(actions, ["[Enter] Add Provider", "[←/→] Pane", "[Esc] Close"]);
+});
+
+test("modal status hydration uses display-only last-known usage snapshots", () => {
+	const status: ProviderStatus = {
+		provider: "openai-codex",
+		rotationMode: "round-robin",
+		activeIndex: 0,
+		credentials: [
+			{
+				credentialId: "openai-codex",
+				credentialType: "oauth",
+				redactedSecret: "token",
+				index: 0,
+				isActive: true,
+				isExpired: false,
+				usageCount: 0,
+				quotaErrorCount: 0,
+				expiresAt: null,
+			},
+		],
+	};
+	const now = Date.now();
+	const hydrated = hydrateStatusWithCachedUsage(
+		{
+			getCachedCredentialUsageDisplaySnapshot(provider: SupportedProviderId, credentialId: string) {
+				assert.equal(provider, "openai-codex");
+				assert.equal(credentialId, "openai-codex");
+				return {
+					snapshot: {
+						timestamp: now,
+						provider,
+						planType: "ChatGPT Team",
+						primary: null,
+						secondary: null,
+						credits: null,
+						copilotQuota: null,
+						updatedAt: now,
+					},
+					error: null,
+					displayOnly: true,
+				};
+			},
+		},
+		status,
+	);
+
+	assert.equal(hydrated.credentials[0]?.usageSnapshot?.planType, "ChatGPT Team");
+	assert.equal(hydrated.credentials[0]?.usageSnapshotDisplayOnly, true);
 });
 
 test("rotation mode labels reflect the actual configured mode", () => {

@@ -113,6 +113,28 @@ function createJwtWithExp(expiresAtSeconds: number): string {
 	].join(".");
 }
 
+function createCodexIdentityJwt(options: {
+	expiresAtSeconds: number;
+	accountId: string;
+	accountUserId: string;
+	email: string;
+}): string {
+	return [
+		createBase64UrlJson({ alg: "none", typ: "JWT" }),
+		createBase64UrlJson({
+			exp: options.expiresAtSeconds,
+			"https://api.openai.com/auth": {
+				chatgpt_account_id: options.accountId,
+				chatgpt_account_user_id: options.accountUserId,
+			},
+			"https://api.openai.com/profile": {
+				email: options.email,
+			},
+		}),
+		"signature",
+	].join(".");
+}
+
 function cloneExtensionConfig(): MultiAuthExtensionConfig {
 	return {
 		...DEFAULT_MULTI_AUTH_CONFIG,
@@ -166,7 +188,7 @@ async function createAccountManagerHarness(
 		debugDir,
 		historyPersistence: extensionConfig.historyPersistence,
 	});
-	const usageService = new UsageService();
+	const usageService = new UsageService(undefined, undefined, undefined, undefined, { persistentCache: false });
 	if (options.usageFetcher) {
 		usageService.register({
 			id: options.providerId,
@@ -981,6 +1003,118 @@ test("account manager deduplicates Cline OAuth credentials by account identity",
 	assert.deepEqual(await accountManager.listProviderCredentialIds("cline"), ["cline-1"]);
 });
 
+test("account manager keeps Codex OAuth credentials separate across account plan contexts", async (t) => {
+	const expiresAtSeconds = Math.floor(Date.now() / 1_000) + 3_600;
+	const { accountManager } = await createAccountManagerHarness(t, {
+		providerId: "openai-codex",
+		authData: {
+			"openai-codex": {
+				type: "oauth",
+				access: createCodexIdentityJwt({
+					expiresAtSeconds,
+					accountId: "acct-personal",
+					accountUserId: "user-same",
+					email: "same@example.com",
+				}),
+				refresh: "refresh-personal",
+				expires: Date.now() + 60_000,
+				provider: "openai-codex",
+				accountId: "acct-personal",
+			},
+			"openai-codex-1": {
+				type: "oauth",
+				access: createCodexIdentityJwt({
+					expiresAtSeconds,
+					accountId: "acct-business-team",
+					accountUserId: "user-same",
+					email: "same@example.com",
+				}),
+				refresh: "refresh-business-team",
+				expires: Date.now() + 120_000,
+				provider: "openai-codex",
+				accountId: "acct-business-team",
+			},
+		},
+	});
+
+	await accountManager.ensureInitialized();
+
+	const credentialIds = await accountManager.listProviderCredentialIds("openai-codex");
+	const providerStatus = await accountManager.getProviderStatus("openai-codex");
+	const status = await accountManager.getStatus();
+	const codexStatus = status.find((entry) => entry.provider === "openai-codex");
+
+	assert.deepEqual(credentialIds, ["openai-codex", "openai-codex-1"]);
+	assert.deepEqual(
+		providerStatus.credentials.map((credential) => credential.credentialId),
+		["openai-codex", "openai-codex-1"],
+	);
+	assert.deepEqual(
+		codexStatus?.credentials.map((credential) => credential.credentialId),
+		["openai-codex", "openai-codex-1"],
+	);
+});
+
+test("account manager preserves Codex direct-login credential ids when identities match", async (t) => {
+	const expiresAtSeconds = Math.floor(Date.now() / 1_000) + 3_600;
+	const baseExpires = Date.now() + 180_000;
+	const backupExpires = Date.now() + 60_000;
+	const baseCredential = {
+		type: "oauth" as const,
+		["access"]: createCodexIdentityJwt({
+			expiresAtSeconds,
+			accountId: "acct-direct-login",
+			accountUserId: "user-same",
+			email: "same@example.com",
+		}),
+		refresh: "base-refresh",
+		expires: baseExpires,
+		provider: "openai-codex",
+		accountId: "acct-direct-login",
+	};
+	const backupCredential = {
+		type: "oauth" as const,
+		["access"]: createCodexIdentityJwt({
+			expiresAtSeconds,
+			accountId: "acct-direct-login",
+			accountUserId: "user-same",
+			email: "same@example.com",
+		}),
+		refresh: "backup-refresh",
+		expires: backupExpires,
+		provider: "openai-codex",
+		accountId: "acct-direct-login",
+	};
+	const { accountManager, authPath } = await createAccountManagerHarness(t, {
+		providerId: "openai-codex",
+		authData: {
+			"openai-codex": baseCredential,
+			"openai-codex-17": backupCredential,
+		},
+	});
+
+	await accountManager.ensureInitialized();
+
+	const credentialIds = await accountManager.listProviderCredentialIds("openai-codex");
+	const providerStatusCredentialIds = (await accountManager.getProviderStatus("openai-codex")).credentials.map(
+		(credential) => credential.credentialId,
+	);
+	const allStatusCredentialIds = (await accountManager.getStatus())
+		.find((entry) => entry.provider === "openai-codex")
+		?.credentials.map((credential) => credential.credentialId);
+	const authData = JSON.parse(await readFile(authPath, "utf-8")) as Record<
+		string,
+		{ expires?: number }
+	>;
+
+	assert.deepEqual(credentialIds, ["openai-codex", "openai-codex-17"]);
+	assert.deepEqual(providerStatusCredentialIds, ["openai-codex", "openai-codex-17"]);
+	assert.deepEqual(allStatusCredentialIds, ["openai-codex", "openai-codex-17"]);
+	assert.deepEqual(Object.keys(authData).sort(), ["openai-codex", "openai-codex-17"]);
+	assert.equal(authData["openai-codex"]?.expires, baseExpires);
+	assert.equal(authData["openai-codex-17"]?.expires, backupExpires);
+});
+
 test("account manager updates an existing Cline OAuth credential instead of adding a duplicate login", async (t) => {
 	resetOAuthProviders();
 	t.after(() => {
@@ -1106,7 +1240,7 @@ test("account manager serves cached usage snapshots without re-reading auth stat
 
 	const authWriter = new AuthWriter(authPath);
 	const storage = new MultiAuthStorage(storagePath);
-	const usageService = new UsageService();
+	const usageService = new UsageService(undefined, undefined, undefined, undefined, { persistentCache: false });
 	usageService.register({
 		id: providerId,
 		displayName: providerId,
@@ -1265,7 +1399,7 @@ test("cascade retry state persists across account-manager restarts and clears on
 			debugDir: harness.debugDir,
 			historyPersistence: DEFAULT_MULTI_AUTH_CONFIG.historyPersistence,
 		}),
-		new UsageService(),
+		new UsageService(undefined, undefined, undefined, undefined, { persistentCache: false }),
 		new ProviderRegistry(new AuthWriter(harness.authPath), harness.modelsPath, [providerId]),
 		undefined,
 		cloneExtensionConfig(),
@@ -1407,13 +1541,14 @@ test("account manager applies configured health scoring thresholds", async (t) =
 			Record<string, { requests?: Array<{ success: boolean }> }>
 		>;
 	};
+	const extractedHealthEntry = Object.values(healthHistory.providers?.[providerId] ?? {})[0];
 	const score = stored.providers[providerId]?.healthState?.scores?.[providerId];
 	assert.ok(score);
 	assert.ok(score.score > 0.6);
 	assert.equal(score.isStale, false);
 	assert.equal(stored.providers[providerId]?.healthState?.history, undefined);
-	assert.equal(healthHistory.providers?.[providerId]?.[providerId]?.requests?.length, 1);
-	assert.equal(healthHistory.providers?.[providerId]?.[providerId]?.requests?.[0]?.success, true);
+	assert.equal(extractedHealthEntry?.requests?.length, 1);
+	assert.equal(extractedHealthEntry?.requests?.[0]?.success, true);
 	assert.match(stored.providers[providerId]?.healthState?.configHash ?? "", /"minRequests":1/);
 });
 
@@ -1428,13 +1563,14 @@ test("storage hydrates embedded telemetry history and migrates it into extracted
 
 	try {
 		const providerId = "migration-provider";
+		const credentialRef = "migration-credential-ref";
 		const state = createDefaultMultiAuthState([providerId]);
 		const providerState = getProviderState(state, providerId);
-		providerState.credentialIds = [providerId];
+		providerState.credentialIds = [credentialRef];
 		providerState.healthState = {
 			scores: {
-				[providerId]: {
-					credentialId: providerId,
+				[credentialRef]: {
+					credentialId: credentialRef,
 					score: 0.82,
 					calculatedAt: 1_717_000_000_000,
 					components: {
@@ -1447,8 +1583,8 @@ test("storage hydrates embedded telemetry history and migrates it into extracted
 				},
 			},
 			history: {
-				[providerId]: {
-					credentialId: providerId,
+				[credentialRef]: {
+					credentialId: credentialRef,
 					requests: [{ timestamp: 1_717_000_000_000, success: true, latencyMs: 42 }],
 					cooldowns: [],
 					lastScore: 0.82,
@@ -1465,7 +1601,7 @@ test("storage hydrates embedded telemetry history and migrates it into extracted
 						cascadePath: [
 							{
 								providerId,
-								credentialId: providerId,
+								credentialId: credentialRef,
 								attemptedAt: 1_717_000_000_100,
 								errorKind: "provider_transient",
 								errorMessage: "legacy embedded history",
@@ -1489,7 +1625,7 @@ test("storage hydrates embedded telemetry history and migrates it into extracted
 		});
 		const hydrated = await storage.read();
 		assert.equal(
-			hydrated.providers[providerId]?.healthState?.history?.[providerId]?.requests.length,
+			hydrated.providers[providerId]?.healthState?.history?.[credentialRef]?.requests.length,
 			1,
 		);
 		assert.equal(
@@ -1499,7 +1635,7 @@ test("storage hydrates embedded telemetry history and migrates it into extracted
 
 		await storage.withLock((current) => {
 			const currentProviderState = getProviderState(current, providerId);
-			currentProviderState.lastUsedAt[providerId] = 1_717_000_002_000;
+			currentProviderState.lastUsedAt[credentialRef] = 1_717_000_002_000;
 			return { result: undefined, next: current };
 		});
 
@@ -1512,27 +1648,34 @@ test("storage hydrates embedded telemetry history and migrates it into extracted
 				}
 			>;
 		};
-		const extractedHealthHistory = JSON.parse(await readFile(historyPaths.healthPath, "utf-8")) as {
-			providers?: Record<string, Record<string, { requests?: Array<unknown> }>>;
+		const extractedHealthHistoryContent = await readFile(historyPaths.healthPath, "utf-8");
+		const extractedCascadeHistoryContent = await readFile(historyPaths.cascadePath, "utf-8");
+		const extractedHealthHistory = JSON.parse(extractedHealthHistoryContent) as {
+			providers?: Record<string, Record<string, { credentialId?: string; requests?: Array<unknown> }>>;
 		};
-		const extractedCascadeHistory = JSON.parse(await readFile(historyPaths.cascadePath, "utf-8")) as {
-			providers?: Record<string, Record<string, Array<{ cascadePath: Array<{ errorMessage: string }> }>>>;
+		const extractedCascadeHistory = JSON.parse(extractedCascadeHistoryContent) as {
+			providers?: Record<
+				string,
+				Record<string, Array<{ cascadePath: Array<{ credentialId?: string; errorMessage: string }> }>>
+			>;
 		};
+		const extractedProviderHealth = extractedHealthHistory.providers?.[providerId] ?? {};
+		const extractedHealthEntry = Object.values(extractedProviderHealth)[0];
+		const extractedCascadeAttempt =
+			extractedCascadeHistory.providers?.[providerId]?.[providerId]?.[0]?.cascadePath[0];
 		const rehydrated = await storage.read();
 
 		assert.equal(compactState.providers[providerId]?.healthState?.history, undefined);
 		assert.equal(compactState.providers[providerId]?.cascadeState, undefined);
+		assert.equal(Object.hasOwn(extractedProviderHealth, credentialRef), false);
+		assert.notEqual(extractedHealthEntry?.credentialId, credentialRef);
+		assert.equal(extractedHealthEntry?.requests?.length, 1);
+		assert.notEqual(extractedCascadeAttempt?.credentialId, credentialRef);
+		assert.equal(extractedCascadeAttempt?.errorMessage, "legacy embedded history");
+		assert.equal(extractedHealthHistoryContent.includes(credentialRef), false);
+		assert.equal(extractedCascadeHistoryContent.includes(credentialRef), false);
 		assert.equal(
-			extractedHealthHistory.providers?.[providerId]?.[providerId]?.requests?.length,
-			1,
-		);
-		assert.equal(
-			extractedCascadeHistory.providers?.[providerId]?.[providerId]?.[0]?.cascadePath[0]
-				?.errorMessage,
-			"legacy embedded history",
-		);
-		assert.equal(
-			rehydrated.providers[providerId]?.healthState?.history?.[providerId]?.requests.length,
+			rehydrated.providers[providerId]?.healthState?.history?.[credentialRef]?.requests.length,
 			1,
 		);
 		assert.equal(
@@ -2284,6 +2427,95 @@ test("oauth refresh scheduler stops retrying after permanent refresh failures", 
 
 	assert.equal(attempts, 1);
 	assert.equal(scheduler.getPendingRefreshes().size, 0);
+});
+
+test("account manager refreshCredential only updates the selected OAuth credential", async (t) => {
+	resetOAuthProviders();
+	t.after(() => {
+		resetOAuthProviders();
+	});
+
+	const providerId = "refresh-scope-provider";
+	const primaryCredentialId = providerId;
+	const backupCredentialId = `${providerId}-1`;
+	const refreshCalls: string[] = [];
+	const primaryExpires = Date.now() + 90_000;
+	const backupExpires = Date.now() + 120_000;
+
+	registerOAuthProvider({
+		id: providerId,
+		name: "Refresh Scope Provider",
+		usesCallbackServer: false,
+		login: async () => {
+			throw new Error("Login is not used in this test.");
+		},
+		refreshToken: async (credentials) => {
+			refreshCalls.push(String(credentials.accountId ?? "unknown"));
+			return {
+				...credentials,
+				["access"]: `refreshed-access-${credentials.accountId}`,
+				["refresh"]: `refreshed-refresh-${credentials.accountId}`,
+				expires: Date.now() + 3_600_000,
+			};
+		},
+		getApiKey: () => "unused-api-key",
+	});
+
+	const { accountManager, authPath } = await createAccountManagerHarness(t, {
+		providerId,
+		authData: {
+			[primaryCredentialId]: {
+				type: "oauth",
+				["access"]: "test-access-primary",
+				["refresh"]: "test-refresh-primary",
+				expires: primaryExpires,
+				provider: providerId,
+				accountId: "acct-primary",
+			},
+			[backupCredentialId]: {
+				type: "oauth",
+				["access"]: "test-access-backup",
+				["refresh"]: "test-refresh-backup",
+				expires: backupExpires,
+				provider: providerId,
+				accountId: "acct-backup",
+			},
+		},
+	});
+
+	await accountManager.ensureInitialized();
+
+	const refreshResult = await accountManager.refreshCredential(providerId, backupCredentialId);
+	const authData = JSON.parse(await readFile(authPath, "utf-8")) as Record<string, StoredAuthCredential>;
+	const primaryCredential = authData[primaryCredentialId];
+	const refreshedCredential = authData[backupCredentialId];
+
+	assert.deepEqual(refreshCalls, ["acct-backup"]);
+	assert.equal(refreshResult.disposition, "refreshed");
+	assert.equal(refreshResult.credential.accountId, "acct-backup");
+	assert.equal(primaryCredential?.type, "oauth");
+	assert.equal(
+		primaryCredential?.type === "oauth" ? primaryCredential.access : undefined,
+		"test-access-primary",
+	);
+	assert.equal(
+		primaryCredential?.type === "oauth" ? primaryCredential.refresh : undefined,
+		"test-refresh-primary",
+	);
+	assert.equal(primaryCredential?.type === "oauth" ? primaryCredential.expires : undefined, primaryExpires);
+	assert.equal(refreshedCredential?.type, "oauth");
+	assert.equal(
+		refreshedCredential?.type === "oauth" ? refreshedCredential.access : undefined,
+		"refreshed-access-acct-backup",
+	);
+	assert.equal(
+		refreshedCredential?.type === "oauth" ? refreshedCredential.refresh : undefined,
+		"refreshed-refresh-acct-backup",
+	);
+	assert.ok(
+		(refreshedCredential?.type === "oauth" ? refreshedCredential.expires : 0) > backupExpires,
+		"expected selected credential expiry to move forward after refresh",
+	);
 });
 
 test("account manager handles permanent Codex refresh failures without console noise", async (t) => {

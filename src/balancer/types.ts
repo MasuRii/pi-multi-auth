@@ -40,6 +40,32 @@ export interface SelectionContext {
 	modelId?: string;
 }
 
+export interface DelegatedCredentialRequest {
+	sessionId: string;
+	providerId: SupportedProviderId;
+	timeoutMs?: number;
+	modelId?: string;
+	modelRef?: string;
+	api?: string;
+	signal?: AbortSignal;
+	parentSessionId?: string;
+}
+
+export interface DelegatedRoutingCapabilities {
+	providerId: SupportedProviderId;
+	modelId?: string;
+	modelRef?: string;
+	api?: string;
+	credentialCounts: {
+		total: number;
+		structurallyEligible: number;
+		modelEligible: number;
+	};
+	modelConstraintApplied: boolean;
+	preferredCredentialCount?: number;
+	failureMessage?: string;
+}
+
 /**
  * Runtime tuning options for the key distributor.
  */
@@ -81,6 +107,22 @@ export interface KeyDistributorMetrics {
  */
 export interface GlobalKeyDistributor {
 	acquireCredential(context: SelectionContext): Promise<CredentialLease | null>;
+	acquireForSubagent(
+		request: DelegatedCredentialRequest,
+	): Promise<{ credentialId: string; apiKey: string }>;
+	acquireForSubagent(
+		sessionId: string,
+		providerId: SupportedProviderId,
+		options?: {
+			timeoutMs?: number;
+			modelId?: string;
+			modelRef?: string;
+			api?: string;
+			signal?: AbortSignal;
+			parentSessionId?: string;
+		},
+	): Promise<{ credentialId: string; apiKey: string }>;
+	releaseFromSubagent(sessionId: string): void;
 	releaseCredential(lease: CredentialLease): Promise<void>;
 	applyCooldown(
 		providerId: SupportedProviderId,
@@ -97,8 +139,11 @@ export interface GlobalKeyDistributor {
 	): Promise<{ credentialId: string; apiKey: string } | null> | { credentialId: string; apiKey: string } | null;
 	shouldBypassDelegatedSubagentAcquisition?(
 		providerId: SupportedProviderId,
-		options?: { modelId?: string; signal?: AbortSignal },
+		options?: { modelId?: string; modelRef?: string; api?: string; signal?: AbortSignal },
 	): Promise<boolean> | boolean;
+	getDelegatedCredentialRoutingCapabilities?(
+		request: DelegatedCredentialRequest,
+	): Promise<DelegatedRoutingCapabilities> | DelegatedRoutingCapabilities;
 	releaseLightweightSessionLeases?(
 		parentSessionId: string,
 		providerId?: SupportedProviderId,

@@ -385,7 +385,7 @@ test("account manager initializes lazily when credentials are first acquired", a
 
 	const authWriter = new AuthWriter(authPath);
 	const storage = new MultiAuthStorage(storagePath);
-	const usageService = new UsageService();
+	const usageService = new UsageService(undefined, undefined, undefined, undefined, { persistentCache: false });
 	const providerRegistry = new ProviderRegistry(authWriter, modelsPath, [providerId]);
 	const accountManager = new AccountManager(authWriter, storage, usageService, providerRegistry);
 
@@ -434,7 +434,7 @@ test("account manager can acquire credentials while core auth lock is held for r
 
 	const authWriter = new AuthWriter(authPath);
 	const storage = new MultiAuthStorage(storagePath);
-	const usageService = new UsageService();
+	const usageService = new UsageService(undefined, undefined, undefined, undefined, { persistentCache: false });
 	const providerRegistry = new ProviderRegistry(authWriter, modelsPath, [providerId]);
 	const accountManager = new AccountManager(authWriter, storage, usageService, providerRegistry);
 	const { FileAuthStorageBackend } = await import(
@@ -525,7 +525,7 @@ test("openai-codex defaults to usage-based rotation when provider state is initi
 
 	const authWriter = new AuthWriter(authPath);
 	const storage = new MultiAuthStorage(storagePath);
-	const usageService = new UsageService();
+	const usageService = new UsageService(undefined, undefined, undefined, undefined, { persistentCache: false });
 	const providerRegistry = new ProviderRegistry(authWriter, modelsPath, [providerId]);
 
 	const accountManager = new AccountManager(authWriter, storage, usageService, providerRegistry);

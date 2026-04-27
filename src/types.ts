@@ -24,13 +24,25 @@ export type SupportedProviderId = string;
 /** Rotation strategies for selecting credentials. */
 export type RotationMode = "round-robin" | "usage-based" | "balancer";
 
+export interface CredentialRequestOverrides {
+	/** Credential-scoped endpoint override used when the endpoint is account-specific. */
+	baseUrl?: string;
+	/** Credential-scoped request headers merged after provider headers. */
+	headers?: Record<string, string>;
+}
+
+export interface StoredCredentialRequestConfig {
+	/** Optional request overrides that travel with a single credential. */
+	request?: CredentialRequestOverrides;
+}
+
 /** OAuth credential payload stored in auth.json entries. */
 export type StoredOAuthCredential = {
 	type: "oauth";
-} & OAuthCredentials;
+} & OAuthCredentials & StoredCredentialRequestConfig;
 
 /** API key payload stored in auth.json entries. */
-export interface StoredApiKeyCredential {
+export interface StoredApiKeyCredential extends StoredCredentialRequestConfig {
 	type: "api_key";
 	key: string;
 }
@@ -134,6 +146,7 @@ export interface CredentialStatus {
 	lastTransientError?: string;
 	lastUsedAt?: number;
 	usageSnapshot?: UsageSnapshot | null;
+	usageSnapshotDisplayOnly?: boolean;
 	usageFetchError?: string;
 	disabledError?: string;
 }

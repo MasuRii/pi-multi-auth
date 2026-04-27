@@ -16,6 +16,7 @@ import {
 } from "./file-retry.js";
 import type {
 	BackupAndStoreResult,
+	CredentialRequestOverrides,
 	StoredApiKeyCredential,
 	StoredAuthCredential,
 	StoredOAuthCredential,
@@ -544,6 +545,42 @@ export class AuthWriter {
 	}
 
 	/**
+	 * Persists credential-scoped request overrides, preserving the credential secret.
+	 */
+	async setCredentialRequestOverrides(
+		credentialId: string,
+		request: CredentialRequestOverrides,
+	): Promise<StoredAuthCredential> {
+		const normalizedCredentialId = credentialId.trim();
+		if (!normalizedCredentialId) {
+			throw new Error("Credential ID cannot be empty.");
+		}
+
+		return this.withLock((data) => {
+			const existing = data[normalizedCredentialId];
+			if (!isStoredCredential(existing)) {
+				throw new Error(
+					`Credential ${normalizedCredentialId} is missing from auth.json. Open /multi-auth and add the account again if needed.`,
+				);
+			}
+
+			const nextCredential: StoredAuthCredential = {
+				...cloneStoredCredential(existing),
+				request: {
+					...existing.request,
+					...request,
+				},
+			};
+			const next = cloneAuthData(data);
+			next[normalizedCredentialId] = nextCredential;
+			return {
+				result: cloneStoredCredential(nextCredential),
+				next,
+			};
+		});
+	}
+
+	/**
 	 * Stores OAuth credentials in provider slot (first account) or provider-N backup slot.
 	 */
 	async setOAuthCredentialAsBackup(
@@ -576,6 +613,7 @@ export class AuthWriter {
 	async setApiKeyCredentialAsBackup(
 		provider: SupportedProviderId,
 		key: string,
+		request?: CredentialRequestOverrides,
 	): Promise<BackupAndStoreResult> {
 		const normalized = key.trim();
 		if (!normalized) {
@@ -613,8 +651,20 @@ export class AuthWriter {
 				uniqueCredentials.push({
 					type: "api_key",
 					key: normalized,
+					...(request && { request }),
 				});
 				firstIndexByApiKey.set(normalized, targetIndex);
+			} else if (request && targetIndex !== undefined) {
+				const existingCredential = uniqueCredentials[targetIndex];
+				if (existingCredential?.type === "api_key") {
+					uniqueCredentials[targetIndex] = {
+						...existingCredential,
+						request: {
+							...existingCredential.request,
+							...request,
+						},
+					};
+				}
 			}
 
 			const existingCredentialIds = existingEntries.map((entry) => entry.credentialId);
@@ -703,16 +753,21 @@ export class AuthWriter {
 				delete next[credentialId];
 			}
 
+			const shouldRenumberCredentialIds = retainedEntries.every(
+				(entry) => entry.credential.type === "api_key",
+			);
 			const normalizedCredentialIds: string[] = [];
 			const credentialIdMap: Record<string, string> = {};
 			for (const [index, entry] of retainedEntries.entries()) {
-				const credentialId = getExpectedProviderCredentialId(provider, index);
+				const credentialId = shouldRenumberCredentialIds
+					? getExpectedProviderCredentialId(provider, index)
+					: entry.credentialId;
 				next[credentialId] = entry.credential;
 				normalizedCredentialIds.push(credentialId);
 				credentialIdMap[entry.credentialId] = credentialId;
 			}
 
-			const renumberedCredentialIds = retainedEntries.some(
+			const renumberedCredentialIds = shouldRenumberCredentialIds && retainedEntries.some(
 				(entry, index) => entry.credentialId !== getExpectedProviderCredentialId(provider, index),
 			);
 
@@ -737,7 +792,7 @@ export class AuthWriter {
 	}
 
 	/**
-	 * Renumbers provider credential IDs sequentially and deduplicates API-key entries.
+	 * Deduplicates API-key entries and renumbers only API-key-only provider slots.
 	 */
 	async normalizeProviderCredentials(
 		seedProviders: readonly string[] = [],

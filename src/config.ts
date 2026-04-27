@@ -10,6 +10,10 @@ import {
 	type HealthScoreWeights,
 } from "./types-health.js";
 import { DEFAULT_OAUTH_CONFIG, type OAuthRefreshConfig } from "./types-oauth.js";
+import {
+	DEFAULT_USAGE_COORDINATION_CONFIG,
+	type UsageCoordinationConfig,
+} from "./usage/usage-coordinator.js";
 
 export const MULTI_AUTH_EXTENSION_ID = "pi-multi-auth";
 
@@ -38,6 +42,7 @@ export interface MultiAuthExtensionConfig {
 	historyPersistence: HistoryPersistenceConfig;
 	modelEntitlements: ModelEntitlementConfig;
 	oauthRefresh: OAuthRefreshConfig;
+	usageCoordination: UsageCoordinationConfig;
 }
 
 export interface MultiAuthConfigLoadResult {
@@ -80,6 +85,7 @@ export const DEFAULT_MULTI_AUTH_CONFIG: MultiAuthExtensionConfig = {
 	historyPersistence: { ...DEFAULT_HISTORY_PERSISTENCE_CONFIG },
 	modelEntitlements: cloneModelEntitlementConfig(DEFAULT_MODEL_ENTITLEMENT_CONFIG),
 	oauthRefresh: cloneOAuthRefreshConfig(DEFAULT_OAUTH_CONFIG),
+	usageCoordination: { ...DEFAULT_USAGE_COORDINATION_CONFIG },
 };
 
 export function cloneHistoryPersistenceConfig(
@@ -122,6 +128,7 @@ export function cloneMultiAuthExtensionConfig(
 		historyPersistence: cloneHistoryPersistenceConfig(config.historyPersistence),
 		modelEntitlements: cloneModelEntitlementConfig(config.modelEntitlements),
 		oauthRefresh: cloneOAuthRefreshConfig(config.oauthRefresh),
+		usageCoordination: { ...config.usageCoordination },
 	};
 }
 
@@ -616,6 +623,95 @@ function normalizeOAuthRefreshConfig(value: unknown, warnings: string[]): OAuthR
 	};
 }
 
+function normalizeUsageCoordinationConfig(
+	value: unknown,
+	warnings: string[],
+): UsageCoordinationConfig {
+	const defaults = DEFAULT_USAGE_COORDINATION_CONFIG;
+	const record = toRecord(value);
+	return {
+		enabled: readBoolean(record.enabled, "usageCoordination.enabled", defaults.enabled, warnings),
+		globalMaxConcurrentFreshRequests: readPositiveInteger(
+			record.globalMaxConcurrentFreshRequests,
+			"usageCoordination.globalMaxConcurrentFreshRequests",
+			defaults.globalMaxConcurrentFreshRequests,
+			warnings,
+		),
+		perProviderMaxConcurrentFreshRequests: readPositiveInteger(
+			record.perProviderMaxConcurrentFreshRequests,
+			"usageCoordination.perProviderMaxConcurrentFreshRequests",
+			defaults.perProviderMaxConcurrentFreshRequests,
+			warnings,
+		),
+		selectionCandidateWindow: readPositiveInteger(
+			record.selectionCandidateWindow,
+			"usageCoordination.selectionCandidateWindow",
+			defaults.selectionCandidateWindow,
+			warnings,
+		),
+		blockedReconciliationCandidateWindow: readPositiveInteger(
+			record.blockedReconciliationCandidateWindow,
+			"usageCoordination.blockedReconciliationCandidateWindow",
+			defaults.blockedReconciliationCandidateWindow,
+			warnings,
+		),
+		entitlementCandidateWindow: readPositiveInteger(
+			record.entitlementCandidateWindow,
+			"usageCoordination.entitlementCandidateWindow",
+			defaults.entitlementCandidateWindow,
+			warnings,
+		),
+		startupCandidateWindow: readPositiveInteger(
+			record.startupCandidateWindow,
+			"usageCoordination.startupCandidateWindow",
+			defaults.startupCandidateWindow,
+			warnings,
+		),
+		modalRefreshCandidateWindow: readPositiveInteger(
+			record.modalRefreshCandidateWindow,
+			"usageCoordination.modalRefreshCandidateWindow",
+			defaults.modalRefreshCandidateWindow,
+			warnings,
+		),
+		manualProviderRefreshCandidateWindow: readPositiveInteger(
+			record.manualProviderRefreshCandidateWindow,
+			"usageCoordination.manualProviderRefreshCandidateWindow",
+			defaults.manualProviderRefreshCandidateWindow,
+			warnings,
+		),
+		accountCooldownMs: readNonNegativeInteger(
+			record.accountCooldownMs,
+			"usageCoordination.accountCooldownMs",
+			defaults.accountCooldownMs,
+			warnings,
+		),
+		providerCooldownMs: readNonNegativeInteger(
+			record.providerCooldownMs,
+			"usageCoordination.providerCooldownMs",
+			defaults.providerCooldownMs,
+			warnings,
+		),
+		circuitBreakerFailureThreshold: readPositiveInteger(
+			record.circuitBreakerFailureThreshold,
+			"usageCoordination.circuitBreakerFailureThreshold",
+			defaults.circuitBreakerFailureThreshold,
+			warnings,
+		),
+		circuitBreakerCooldownMs: readNonNegativeInteger(
+			record.circuitBreakerCooldownMs,
+			"usageCoordination.circuitBreakerCooldownMs",
+			defaults.circuitBreakerCooldownMs,
+			warnings,
+		),
+		jitterMs: readNonNegativeInteger(
+			record.jitterMs,
+			"usageCoordination.jitterMs",
+			defaults.jitterMs,
+			warnings,
+		),
+	};
+}
+
 function normalizeConfig(raw: unknown): { config: MultiAuthExtensionConfig; warnings: string[] } {
 	const warnings: string[] = [];
 	if (raw !== undefined && (!raw || typeof raw !== "object" || Array.isArray(raw))) {
@@ -640,6 +736,7 @@ function normalizeConfig(raw: unknown): { config: MultiAuthExtensionConfig; warn
 			historyPersistence: normalizeHistoryPersistenceConfig(record.historyPersistence, warnings),
 			modelEntitlements: normalizeModelEntitlementConfig(record.modelEntitlements, warnings),
 			oauthRefresh: normalizeOAuthRefreshConfig(record.oauthRefresh, warnings),
+			usageCoordination: normalizeUsageCoordinationConfig(record.usageCoordination, warnings),
 		},
 		warnings,
 	};

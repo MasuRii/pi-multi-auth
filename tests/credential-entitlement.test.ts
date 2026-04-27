@@ -11,6 +11,8 @@ import {
 import { AuthWriter } from "../src/auth-writer.js";
 import {
 	isPlanEligibleForModel,
+	modelPrefersFreePlan,
+	modelRequiresEntitlement,
 	normalizeCodexPlanType,
 } from "../src/model-entitlements.js";
 import { ProviderRegistry } from "../src/provider-registry.js";
@@ -24,15 +26,19 @@ type TestCredential = {
 	credentialId: string;
 	secret: string;
 	planType: string | null;
+	primaryUsedPercent?: number;
 };
 
-function createUsageSnapshot(planType: string | null): UsageSnapshot {
+function createUsageSnapshot(credential: Pick<TestCredential, "planType" | "primaryUsedPercent">): UsageSnapshot {
 	const now = Date.now();
+	const primaryUsedPercent = credential.primaryUsedPercent;
 	return {
 		timestamp: now,
 		provider: CODEX_PROVIDER_ID,
-		planType,
-		primary: null,
+		planType: credential.planType,
+		primary: typeof primaryUsedPercent === "number"
+			? { usedPercent: primaryUsedPercent, windowMinutes: 10_080, resetsAt: Math.ceil((now + 10_080 * 60_000) / 1000) }
+			: null,
 		secondary: null,
 		credits: null,
 		copilotQuota: null,
@@ -52,8 +58,8 @@ async function createCodexAccountManager(
 	const authPath = join(tempRoot, "auth.json");
 	const storagePath = join(tempRoot, "multi-auth.json");
 	const modelsPath = join(tempRoot, "models.json");
-	const planTypeBySecret = new Map<string, string | null>(
-		credentials.map((credential) => [credential.secret, credential.planType]),
+	const credentialBySecret = new Map(
+		credentials.map((credential) => [credential.secret, credential]),
 	);
 
 	await writeFile(
@@ -74,12 +80,12 @@ async function createCodexAccountManager(
 
 	const authWriter = new AuthWriter(authPath);
 	const storage = new MultiAuthStorage(storagePath);
-	const usageService = new UsageService();
+	const usageService = new UsageService(undefined, undefined, undefined, undefined, { persistentCache: false });
 	usageService.register({
 		id: CODEX_PROVIDER_ID,
 		displayName: "OpenAI Codex",
 		fetchUsage: async (auth: UsageAuth) =>
-			createUsageSnapshot(planTypeBySecret.get(auth.accessToken) ?? null),
+			createUsageSnapshot(credentialBySecret.get(auth.accessToken) ?? { planType: null }),
 	});
 	const providerRegistry = new ProviderRegistry(authWriter, modelsPath, [CODEX_PROVIDER_ID]);
 
@@ -96,6 +102,9 @@ test("codex plan normalization recognizes paid-plan labels for restricted models
 	assert.equal(isPlanEligibleForModel("enterprise"), true);
 	assert.equal(isPlanEligibleForModel("free"), false);
 	assert.equal(isPlanEligibleForModel("unknown"), false);
+	assert.equal(modelPrefersFreePlan(CODEX_PROVIDER_ID, "gpt-5.4"), true);
+	assert.equal(modelRequiresEntitlement(CODEX_PROVIDER_ID, "gpt-5.4"), false);
+	assert.equal(modelRequiresEntitlement(CODEX_PROVIDER_ID, "gpt-5.5"), true);
 });
 
 test("account manager preserves current selection for unconstrained codex requests", async (t) => {
@@ -109,7 +118,7 @@ test("account manager preserves current selection for unconstrained codex reques
 	assert.equal(selected.provider, CODEX_PROVIDER_ID);
 });
 
-test("account manager skips free codex credentials for restricted models", async (t) => {
+test("account manager prefers free codex credentials for free-eligible models", async (t) => {
 	const accountManager = await createCodexAccountManager(t, [
 		{ credentialId: "openai-codex", secret: "sk-free-key", planType: "free" },
 		{ credentialId: "openai-codex-1", secret: "sk-plus-key", planType: "plus" },
@@ -119,10 +128,10 @@ test("account manager skips free codex credentials for restricted models", async
 	const selected = await accountManager.acquireCredential(CODEX_PROVIDER_ID, {
 		modelId: "gpt-5.4",
 	});
-	assert.equal(selected.credentialId, "openai-codex-1");
+	assert.equal(selected.credentialId, "openai-codex");
 });
 
-test("account manager reuses constrained codex usage lookups across repeated selections", async (t) => {
+test("account manager reuses codex model routing usage lookups across repeated selections", async (t) => {
 	const tempRoot = await mkdtemp(join(tmpdir(), "pi-multi-auth-entitlement-cache-"));
 	t.after(async () => {
 		await rm(tempRoot, { recursive: true, force: true });
@@ -159,13 +168,13 @@ test("account manager reuses constrained codex usage lookups across repeated sel
 
 	const authWriter = new AuthWriter(authPath);
 	const storage = new MultiAuthStorage(storagePath);
-	const usageService = new UsageService();
+	const usageService = new UsageService(undefined, undefined, undefined, undefined, { persistentCache: false });
 	usageService.register({
 		id: CODEX_PROVIDER_ID,
 		displayName: "OpenAI Codex",
 		fetchUsage: async (auth: UsageAuth) => {
 			fetchCountBySecret.set(auth.accessToken, (fetchCountBySecret.get(auth.accessToken) ?? 0) + 1);
-			return createUsageSnapshot(planTypeBySecret.get(auth.accessToken) ?? null);
+			return createUsageSnapshot({ planType: planTypeBySecret.get(auth.accessToken) ?? null });
 		},
 	});
 	const providerRegistry = new ProviderRegistry(authWriter, modelsPath, [CODEX_PROVIDER_ID]);
@@ -196,6 +205,30 @@ test("account manager reuses constrained codex usage lookups across repeated sel
 	});
 });
 
+test("account manager falls back to paid codex credentials when free usage is exhausted", async (t) => {
+	const accountManager = await createCodexAccountManager(t, [
+		{ credentialId: "openai-codex", secret: "sk-free-key", planType: "free", primaryUsedPercent: 100 },
+		{ credentialId: "openai-codex-1", secret: "sk-plus-key", planType: "plus", primaryUsedPercent: 10 },
+	]);
+
+	const selected = await accountManager.acquireCredential(CODEX_PROVIDER_ID, {
+		modelId: "gpt-5.4",
+	});
+	assert.equal(selected.credentialId, "openai-codex-1");
+});
+
+test("account manager skips free codex credentials for paid-only models", async (t) => {
+	const accountManager = await createCodexAccountManager(t, [
+		{ credentialId: "openai-codex", secret: "sk-free-key", planType: "free" },
+		{ credentialId: "openai-codex-1", secret: "sk-plus-key", planType: "plus" },
+	]);
+
+	const selected = await accountManager.acquireCredential(CODEX_PROVIDER_ID, {
+		modelId: "gpt-5.5",
+	});
+	assert.equal(selected.credentialId, "openai-codex-1");
+});
+
 test("account manager rejects restricted codex selection when no eligible plan exists", async (t) => {
 	const accountManager = await createCodexAccountManager(t, [
 		{ credentialId: "openai-codex", secret: "sk-free-key", planType: "free" },
@@ -205,7 +238,7 @@ test("account manager rejects restricted codex selection when no eligible plan e
 	await assert.rejects(
 		() =>
 			accountManager.acquireCredential(CODEX_PROVIDER_ID, {
-				modelId: "gpt-5.4",
+				modelId: "gpt-5.5",
 			}),
 		/no eligible credentials available with a paid plan|No credentials available with a paid plan/i,
 	);
