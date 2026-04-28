@@ -222,7 +222,7 @@ export default async function multiAuthExtension(pi: ExtensionAPI): Promise<void
 		clearStartupTimers();
 		shutdownPromise = (async () => {
 			try {
-				accountManager.shutdown();
+				await accountManager.shutdown();
 			} catch (error) {
 				const message = `Failed to stop multi-auth background services: ${getErrorMessage(error)}`;
 				multiAuthDebugLogger.log("session_shutdown_warning", {

@@ -149,6 +149,7 @@ export class UsageService {
 	private readonly cacheKeysByCredential = new Map<string, Set<string>>();
 	private readonly displayCache = new Map<string, UsageDisplayCacheEntry>();
 	private readonly displayCacheKeysByCredential = new Map<string, Set<string>>();
+	private readonly preferredCredentialCacheKeys = new Map<string, string>();
 	private readonly inFlight = new Map<string, Promise<Omit<UsageFetchResult, "fromCache">>>();
 	private readonly persistentCacheStore?: UsageSnapshotCacheStore;
 
@@ -222,11 +223,29 @@ export class UsageService {
 	}
 
 	/**
+	 * Registers the currently active credential material for one provider credential pair.
+	 * This lets auth-aware callers prefer the matching cache record when historical entries exist.
+	 */
+	setPreferredCredentialCacheKey(
+		providerId: string,
+		credentialId: string,
+		credentialCacheKey: string | null,
+	): void {
+		const indexKey = providerCredentialIndexKey(providerId, credentialId);
+		if (!credentialCacheKey) {
+			this.preferredCredentialCacheKeys.delete(indexKey);
+			return;
+		}
+		this.preferredCredentialCacheKeys.set(indexKey, cacheKey(providerId, credentialId, credentialCacheKey));
+	}
+
+	/**
 	 * Clears cache for one credential.
 	 */
 	clearCredential(providerId: string, credentialId: string): void {
 		this.clearIndexedCache(providerId, credentialId, this.cache, this.cacheKeysByCredential, true);
 		this.clearIndexedCache(providerId, credentialId, this.displayCache, this.displayCacheKeysByCredential);
+		this.preferredCredentialCacheKeys.delete(providerCredentialIndexKey(providerId, credentialId));
 	}
 
 	/**
@@ -235,6 +254,11 @@ export class UsageService {
 	clearProvider(providerId: string): void {
 		this.clearIndexedCacheProvider(providerId, this.cache, this.cacheKeysByCredential, true);
 		this.clearIndexedCacheProvider(providerId, this.displayCache, this.displayCacheKeysByCredential);
+		for (const indexKey of [...this.preferredCredentialCacheKeys.keys()]) {
+			if (indexKey.startsWith(`${providerId} `)) {
+				this.preferredCredentialCacheKeys.delete(indexKey);
+			}
+		}
 	}
 
 
@@ -389,12 +413,52 @@ export class UsageService {
 		}
 	}
 
+	private resolvePreferredCachedRead(
+		providerId: string,
+		credentialId: string,
+		options: UsageFetchOptions,
+		now: number,
+	): ResolvedUsageCacheRead | null {
+		const preferredKey = this.preferredCredentialCacheKeys.get(
+			providerCredentialIndexKey(providerId, credentialId),
+		);
+		return preferredKey ? this.resolveCachedRead(preferredKey, options, now) : null;
+	}
+
+	private resolvePreferredDisplayRead(
+		providerId: string,
+		credentialId: string,
+		now: number,
+	): UsageFetchResult | null {
+		const preferredKey = this.preferredCredentialCacheKeys.get(
+			providerCredentialIndexKey(providerId, credentialId),
+		);
+		if (!preferredKey) {
+			return null;
+		}
+
+		const entry = this.displayCache.get(preferredKey);
+		if (!entry || entry.displayUntil <= now || !entry.result.snapshot) {
+			return null;
+		}
+
+		return {
+			...entry.result,
+			fromCache: true,
+		};
+	}
+
 	private resolveCachedReadForCredential(
 		providerId: string,
 		credentialId: string,
 		options: UsageFetchOptions,
 		now: number,
 	): ResolvedUsageCacheRead | null {
+		const preferredRead = this.resolvePreferredCachedRead(providerId, credentialId, options, now);
+		if (preferredRead) {
+			return preferredRead;
+		}
+
 		const keys = this.cacheKeysByCredential.get(providerCredentialIndexKey(providerId, credentialId));
 		if (!keys || keys.size === 0) {
 			return null;
@@ -422,6 +486,11 @@ export class UsageService {
 		credentialId: string,
 		now: number,
 	): UsageFetchResult | null {
+		const preferredRead = this.resolvePreferredDisplayRead(providerId, credentialId, now);
+		if (preferredRead) {
+			return preferredRead;
+		}
+
 		const keys = this.displayCacheKeysByCredential.get(providerCredentialIndexKey(providerId, credentialId));
 		if (!keys || keys.size === 0) {
 			return null;

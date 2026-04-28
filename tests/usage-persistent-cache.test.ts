@@ -556,6 +556,51 @@ test("usage service separates cache records for reused credential ids with diffe
 	);
 });
 
+test("usage service resolves ambiguous credential-id cache history when the current credential key is known", async (t) => {
+	const { tempRoot, cachePath } = await createTempUsageCachePath();
+	t.after(async () => {
+		await rm(tempRoot, { recursive: true, force: true });
+	});
+
+	const providerId = "openai-codex";
+	const credentialId = "openai-codex";
+	const freeAuth = { accessToken: "[REDACTED]", accountId: "account-free", credential: { accountId: "account-free" } };
+	const teamAuth = { accessToken: "[REDACTED]", accountId: "account-team", credential: { accountId: "account-team" } };
+	const freeSnapshot = { ...createUsageSnapshot(providerId), planType: "free" };
+	const teamSnapshot = { ...createUsageSnapshot(providerId), planType: "ChatGPT Team" };
+	const usageService = new UsageService(30_000, 300_000, 10_000, undefined, {
+		persistentCache: new UsageSnapshotCacheStore({ filePath: cachePath, maxEntries: 10 }),
+	});
+	let activeSnapshot = freeSnapshot;
+	usageService.register({
+		id: providerId,
+		displayName: providerId,
+		fetchUsage: async () => activeSnapshot,
+	});
+
+	await usageService.fetchUsage(providerId, credentialId, freeAuth, { forceRefresh: true });
+	activeSnapshot = teamSnapshot;
+	await usageService.fetchUsage(providerId, credentialId, teamAuth, { forceRefresh: true });
+
+	assert.equal(usageService.readCachedUsage(providerId, credentialId, { allowStale: true }), null);
+	assert.equal(usageService.readDisplayUsage(providerId, credentialId), null);
+
+	usageService.setPreferredCredentialCacheKey(
+		providerId,
+		credentialId,
+		createUsageCredentialCacheKey(providerId, credentialId, teamAuth),
+	);
+
+	assert.equal(
+		usageService.readCachedUsage(providerId, credentialId, { allowStale: true })?.snapshot?.planType,
+		"ChatGPT Team",
+	);
+	assert.equal(usageService.readDisplayUsage(providerId, credentialId)?.snapshot?.planType, "ChatGPT Team");
+
+	usageService.setPreferredCredentialCacheKey(providerId, credentialId, null);
+	assert.equal(usageService.readCachedUsage(providerId, credentialId, { allowStale: true }), null);
+});
+
 test("account manager hydrates persisted usage cache during initialization and serves warm-start reads", async (t) => {
 	const tempRoot = await mkdtemp(join(tmpdir(), "pi-multi-auth-usage-cache-account-manager-"));
 	const authPath = join(tempRoot, "auth.json");
@@ -638,8 +683,8 @@ test("account manager hydrates persisted usage cache during initialization and s
 	const providerRegistry = new ProviderRegistry(authWriter, modelsPath, [providerId]);
 	const accountManager = new AccountManager(authWriter, storage, usageService, providerRegistry);
 
-	t.after(() => {
-		accountManager.shutdown();
+	t.after(async () => {
+		await accountManager.shutdown();
 	});
 
 	await accountManager.ensureInitialized();

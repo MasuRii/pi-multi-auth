@@ -65,6 +65,14 @@ interface ProviderPolicyState {
 const PROGRESSIVE_WINDOW_OPERATIONS = new Set<UsageCoordinationOperation>([
 	"modal-refresh",
 ]);
+const ROTATING_WINDOW_OPERATIONS = new Set<UsageCoordinationOperation>([
+	"selection",
+	"blocked-reconciliation",
+	"entitlement",
+	"startup-refinement",
+	"modal-refresh",
+	"manual-provider-refresh",
+]);
 
 function cloneUsageCoordinationConfig(
 	config: UsageCoordinationConfig = DEFAULT_USAGE_COORDINATION_CONFIG,
@@ -169,6 +177,14 @@ export class UsageCoordinator {
 		return this.selectBoundedWindow(uniqueCredentialIds, operation, "credential-ids");
 	}
 
+	selectCredentialIdWindows(
+		credentialIds: readonly string[],
+		operation: UsageCoordinationOperation,
+	): string[][] {
+		const uniqueCredentialIds = [...new Set(credentialIds.map((entry) => entry.trim()).filter(Boolean))];
+		return this.partitionBoundedWindows(uniqueCredentialIds, operation, "credential-ids");
+	}
+
 	selectCredentialRequests<TRequest extends { provider: string; credentialId: string }>(
 		requests: readonly TRequest[],
 		operation: UsageCoordinationOperation,
@@ -189,6 +205,42 @@ export class UsageCoordinator {
 			uniqueRequests.push(request);
 		}
 		return this.selectBoundedWindow(uniqueRequests, operation, "credential-requests");
+	}
+
+	selectCredentialRequestWindows<TRequest extends { provider: string; credentialId: string }>(
+		requests: readonly TRequest[],
+		operation: UsageCoordinationOperation,
+	): TRequest[][] {
+		return this.partitionBoundedWindows(
+			this.deduplicateCredentialRequests(requests),
+			operation,
+			"credential-requests",
+		);
+	}
+
+	getOperationWindowSize(operation: UsageCoordinationOperation): number {
+		return Math.max(1, getOperationWindow(this.config, operation));
+	}
+
+	private deduplicateCredentialRequests<TRequest extends { provider: string; credentialId: string }>(
+		requests: readonly TRequest[],
+	): TRequest[] {
+		const seen = new Set<string>();
+		const uniqueRequests: TRequest[] = [];
+		for (const request of requests) {
+			const provider = request.provider.trim();
+			const credentialId = request.credentialId.trim();
+			if (!provider || !credentialId) {
+				continue;
+			}
+			const key = this.credentialRequestKey(provider, credentialId);
+			if (seen.has(key)) {
+				continue;
+			}
+			seen.add(key);
+			uniqueRequests.push(request);
+		}
+		return uniqueRequests;
 	}
 
 	private selectBoundedWindow<TValue>(
@@ -214,6 +266,47 @@ export class UsageCoordinator {
 		}
 		this.progressiveWindowCursors.set(cursorKey, (startIndex + selected.length) % candidates.length);
 		return selected;
+	}
+
+	private partitionBoundedWindows<TValue>(
+		candidates: readonly TValue[],
+		operation: UsageCoordinationOperation,
+		cursorScope: string,
+	): TValue[][] {
+		if (candidates.length === 0) {
+			this.progressiveWindowCursors.delete(this.progressiveWindowCursorKey(operation, cursorScope));
+			return [];
+		}
+
+		const windowSize = this.getOperationWindowSize(operation);
+		if (candidates.length <= windowSize) {
+			this.progressiveWindowCursors.delete(this.progressiveWindowCursorKey(operation, cursorScope));
+			return [[...candidates]];
+		}
+
+		const rotated = this.rotateCandidates(candidates, operation, cursorScope);
+		const windows: TValue[][] = [];
+		for (let index = 0; index < rotated.length; index += windowSize) {
+			windows.push(rotated.slice(index, index + windowSize));
+		}
+		return windows;
+	}
+
+	private rotateCandidates<TValue>(
+		candidates: readonly TValue[],
+		operation: UsageCoordinationOperation,
+		cursorScope: string,
+	): TValue[] {
+		if (!ROTATING_WINDOW_OPERATIONS.has(operation) || candidates.length === 0) {
+			return [...candidates];
+		}
+
+		const cursorKey = this.progressiveWindowCursorKey(operation, cursorScope);
+		const windowSize = this.getOperationWindowSize(operation);
+		const startIndex = (this.progressiveWindowCursors.get(cursorKey) ?? 0) % candidates.length;
+		const rotated = [...candidates.slice(startIndex), ...candidates.slice(0, startIndex)];
+		this.progressiveWindowCursors.set(cursorKey, (startIndex + windowSize) % candidates.length);
+		return rotated;
 	}
 
 	private progressiveWindowCursorKey(

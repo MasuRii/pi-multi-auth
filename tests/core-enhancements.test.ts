@@ -211,7 +211,7 @@ async function createAccountManagerHarness(
 	);
 
 	t.after(async () => {
-		accountManager.shutdown();
+		await accountManager.shutdown();
 		await rm(tempRoot, { recursive: true, force: true });
 	});
 
@@ -1262,8 +1262,8 @@ test("account manager serves cached usage snapshots without re-reading auth stat
 	const providerRegistry = new ProviderRegistry(authWriter, modelsPath, [providerId]);
 	const accountManager = new AccountManager(authWriter, storage, usageService, providerRegistry);
 
-	t.after(() => {
-		accountManager.shutdown();
+	t.after(async () => {
+		await accountManager.shutdown();
 	});
 
 	const first = await accountManager.getCredentialUsageSnapshot(providerId, providerId, {
@@ -1404,8 +1404,8 @@ test("cascade retry state persists across account-manager restarts and clears on
 		undefined,
 		cloneExtensionConfig(),
 	);
-	t.after(() => {
-		restarted.shutdown();
+	t.after(async () => {
+		await restarted.shutdown();
 	});
 
 	await restarted.ensureInitialized();
