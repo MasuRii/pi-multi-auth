@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.5.0 - 2026-04-28
+
+### Changed
+- Updated OpenAI Codex account selection to prefer fresh or durable cached usage evidence before scheduling bounded background refreshes, reducing selection latency while preserving quota-aware routing.
+- Refined usage coordination with rotating candidate windows, preferred credential cache keys, and cache disambiguation for reused Codex credential ids.
+- Updated Codex paid-entitlement checks to use durable negative usage evidence without forcing a fresh bootstrap when cached plan data is authoritative.
+- Added explicit Codex usage request timeouts, including IPv4 fallback timeout handling, so stalled usage probes fail with clear diagnostic errors.
+- Updated package metadata and lockfile version to `0.5.0` for release preparation.
+
 ## 0.4.0 - 2026-04-27
 
 ### Added
