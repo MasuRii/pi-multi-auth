@@ -1288,6 +1288,57 @@ test("account manager serves cached usage snapshots without re-reading auth stat
 	assert.equal(fetchCount, 1);
 });
 
+test("provider registry lists pi-mono API-key, models.json, and credential-known providers", async (t) => {
+	const tempRoot = await mkdtemp(join(tmpdir(), "pi-multi-auth-api-key-providers-"));
+	const authPath = join(tempRoot, "auth.json");
+	const modelsPath = join(tempRoot, "models.json");
+
+	t.after(async () => {
+		await rm(tempRoot, { recursive: true, force: true });
+	});
+
+	await writeFile(
+		authPath,
+		JSON.stringify(
+			{
+				"credential-known-provider": { type: "api_key", key: "credential-key" },
+			},
+			null,
+			2,
+		),
+		"utf-8",
+	);
+	await writeFile(
+		modelsPath,
+		JSON.stringify(
+			{
+				providers: {
+					"custom-model-provider": {
+						api: "openai",
+						baseUrl: "https://example.test/v1",
+						models: [{ id: "custom-model", name: "Custom Model" }],
+					},
+				},
+			},
+			null,
+			2,
+		),
+		"utf-8",
+	);
+
+	const registry = new ProviderRegistry(new AuthWriter(authPath), modelsPath, []);
+	const providers = await registry.listAvailableApiKeyProviders();
+	const providerIds = providers.map((provider) => provider.provider);
+
+	assert.ok(providerIds.includes("openrouter"), "expected mirrored pi-mono API-key provider");
+	assert.ok(providerIds.includes("custom-model-provider"), "expected models.json provider");
+	assert.ok(providerIds.includes("credential-known-provider"), "expected auth.json provider");
+	assert.equal(
+		providers.find((provider) => provider.provider === "openrouter")?.name,
+		"OpenRouter",
+	);
+});
+
 test("provider registry refreshes models metadata after models.json changes", async (t) => {
 	const tempRoot = await mkdtemp(join(tmpdir(), "pi-multi-auth-provider-registry-"));
 	t.after(async () => {

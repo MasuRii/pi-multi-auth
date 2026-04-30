@@ -51,9 +51,9 @@ test("smart OAuth provider options dedupe overlap and highlight selected/configu
 		"anthropic",
 		"openai-codex",
 	]);
-	assert.match(options[0]?.label ?? "", /selected/);
-	assert.match(options[1]?.label ?? "", /2 credentials configured/);
-	assert.match(options[2]?.label ?? "", /1 credential configured/);
+	assert.equal(options[0]?.isSelected, true);
+	assert.equal(options[1]?.credentialCount, 2);
+	assert.equal(options[2]?.credentialCount, 1);
 });
 
 test("smart API-key provider options keep selected provider first and retain custom entry", () => {
@@ -72,9 +72,39 @@ test("smart API-key provider options keep selected provider first and retain cus
 		"vivgrid",
 		CUSTOM_PROVIDER_NAME_OPTION,
 	]);
-	assert.match(options[0]?.label ?? "", /selected/);
-	assert.match(options[1]?.label ?? "", /2 credentials configured/);
-	assert.equal(options.at(-1)?.label, "Use custom provider name…");
+	assert.equal(options[0]?.isSelected, true);
+	assert.equal(options[1]?.credentialCount, 2);
+	assert.equal(options.at(-1)?.name, "Use custom provider name…");
+});
+
+test("smart API-key provider options include unconfigured supported providers and dedupe statuses", () => {
+	const options = buildSmartApiKeyProviderOptions(
+		[
+			{ provider: "vivgrid", credentials: createCredentials(1) },
+			{ provider: "custom-model-provider", credentials: createCredentials(0) },
+		],
+		"openrouter",
+		[
+			{ provider: "anthropic", name: "Anthropic" },
+			{ provider: "openrouter", name: "OpenRouter" },
+			{ provider: "vivgrid", name: "Vivgrid" },
+		],
+	);
+
+	assert.deepEqual(options.map((option) => option.provider), [
+		"openrouter",
+		"vivgrid",
+		"anthropic",
+		"custom-model-provider",
+		CUSTOM_PROVIDER_NAME_OPTION,
+	]);
+	assert.equal(options[0]?.credentialCount, 0);
+	assert.equal(options[1]?.credentialCount, 1);
+	assert.equal(options[1]?.isConfigured, true);
+	assert.equal(options[0]?.name, "OpenRouter");
+	assert.equal(options[0]?.isSelected, true);
+	assert.equal(options[2]?.name, "Anthropic");
+	assert.equal(options.at(-1)?.name, "Use custom provider name…");
 });
 
 test("provider input normalization canonicalizes known providers and rejects invalid names", () => {

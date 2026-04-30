@@ -1,5 +1,5 @@
 import { readFile, stat } from "node:fs/promises";
-import { getModels, type Api, type Model } from "@mariozechner/pi-ai";
+import { getModels, getProviders, type Api, type Model } from "@mariozechner/pi-ai";
 import { getOAuthProvider, getOAuthProviders } from "./oauth-compat.js";
 import { registerClineOAuthProvider } from "./oauth-cline.js";
 import { AuthWriter } from "./auth-writer.js";
@@ -42,6 +42,40 @@ export interface AvailableOAuthProvider {
 	provider: SupportedProviderId;
 	name: string;
 }
+
+export interface AvailableApiKeyProvider {
+	provider: SupportedProviderId;
+	name: string;
+}
+
+const API_KEY_LOGIN_PROVIDER_DISPLAY_NAMES: Readonly<Record<string, string>> = {
+	anthropic: "Anthropic",
+	"amazon-bedrock": "Amazon Bedrock",
+	"azure-openai-responses": "Azure OpenAI Responses",
+	cerebras: "Cerebras",
+	"cloudflare-workers-ai": "Cloudflare Workers AI",
+	deepseek: "DeepSeek",
+	fireworks: "Fireworks",
+	google: "Google Gemini",
+	"google-vertex": "Google Vertex AI",
+	groq: "Groq",
+	huggingface: "Hugging Face",
+	"kimi-coding": "Kimi For Coding",
+	mistral: "Mistral",
+	minimax: "MiniMax",
+	"minimax-cn": "MiniMax (China)",
+	opencode: "OpenCode Zen",
+	"opencode-go": "OpenCode Go",
+	openai: "OpenAI",
+	openrouter: "OpenRouter",
+	"vercel-ai-gateway": "Vercel AI Gateway",
+	xai: "xAI",
+	zai: "ZAI",
+};
+
+const BUILT_IN_API_KEY_LOGIN_PROVIDER_IDS = new Set(
+	Object.keys(API_KEY_LOGIN_PROVIDER_DISPLAY_NAMES),
+);
 
 const EMPTY_MODELS_FILE: ModelsFileData = {
 	providers: {},
@@ -215,6 +249,24 @@ function isMissingFileError(error: unknown): boolean {
 	);
 }
 
+function isPiMonoApiKeyLoginProvider(
+	providerId: string,
+	oauthProviderIds: ReadonlySet<string>,
+	builtInProviderIds: ReadonlySet<string>,
+): boolean {
+	if (BUILT_IN_API_KEY_LOGIN_PROVIDER_IDS.has(providerId)) {
+		return true;
+	}
+	if (builtInProviderIds.has(providerId)) {
+		return false;
+	}
+	return !oauthProviderIds.has(providerId);
+}
+
+function getApiKeyProviderDisplayName(providerId: string): string {
+	return API_KEY_LOGIN_PROVIDER_DISPLAY_NAMES[providerId] ?? providerId;
+}
+
 export class ProviderRegistry {
 	private modelsFileCache: ModelsFileCacheEntry | null = null;
 	private modelsFileLoadPromise: Promise<ModelsFileData> | null = null;
@@ -286,6 +338,46 @@ export class ProviderRegistry {
 				name: provider.name.trim() || providerId,
 			});
 		}
+		return providers;
+	}
+
+	async listAvailableApiKeyProviders(): Promise<AvailableApiKeyProvider[]> {
+		const modelsFile = await this.readModelsFile();
+		const modelProviderIds = Object.keys(modelsFile.providers);
+		const authProviderIds = await this.authWriter.listProviderIds([
+			...this.legacyProviders,
+			...modelProviderIds,
+		]);
+		const builtInProviderIds = new Set<string>(getProviders());
+		const oauthProviderIds = new Set(
+			this.listAvailableOAuthProviders().map((provider) => provider.provider),
+		);
+		const providers: AvailableApiKeyProvider[] = [];
+		const seenProviders = new Set<SupportedProviderId>();
+		const pushUnique = (provider: string): void => {
+			const providerId = provider.trim();
+			if (!providerId || seenProviders.has(providerId)) {
+				return;
+			}
+			seenProviders.add(providerId);
+			providers.push({
+				provider: providerId,
+				name: getApiKeyProviderDisplayName(providerId),
+			});
+		};
+
+		for (const provider of BUILT_IN_API_KEY_LOGIN_PROVIDER_IDS) {
+			pushUnique(provider);
+		}
+		for (const provider of modelProviderIds) {
+			if (isPiMonoApiKeyLoginProvider(provider, oauthProviderIds, builtInProviderIds)) {
+				pushUnique(provider);
+			}
+		}
+		for (const provider of authProviderIds) {
+			pushUnique(provider);
+		}
+
 		return providers;
 	}
 

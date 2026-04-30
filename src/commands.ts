@@ -10,6 +10,7 @@ import {
 	toggleBatchSelection,
 } from "./account-batch-selection.js";
 import { runOAuthLoginDialog } from "./oauth-login-flow.js";
+import { runProviderConfigurationDialog } from "./provider-configuration-dialog.js";
 import { getErrorMessage } from "./auth-error-utils.js";
 import { parseApiKeyBatchInput } from "./credential-display.js";
 import { ModalVisibilityController } from "./modal-visibility.js";
@@ -87,6 +88,17 @@ type CredentialUsageDisplayState = {
 	usageSnapshotDisplayOnly?: boolean;
 };
 
+type PlanHighlightColor = "accent" | "mdLink" | "success" | "text" | "toolTitle" | "warning";
+
+interface AccountColumnWidths {
+	alias: number;
+	account: number;
+}
+
+const ACCOUNT_ROW_PREFIX_WIDTH = 8;
+const ACCOUNT_TABLE_MIN_WIDTH = 30;
+const NEUTRAL_PLAN_LABELS = new Set(["", "free", "n/a", "na", "no plan", "none", "null", "unknown"]);
+
 const THREE_PANE_MIN_WIDTH = 96;
 const GRID_BODY_ROW_COUNT = 22;
 const MIN_BODY_ROW_COUNT = 4;
@@ -127,9 +139,14 @@ type ProviderChoiceCandidate = {
 	isSelected: boolean;
 };
 
+type SupportedApiKeyProviderSummary = Readonly<{
+	provider: SupportedProviderId;
+	name?: string;
+}>;
+
 export interface SmartApiKeyProviderOption {
 	provider: SupportedProviderId | typeof CUSTOM_PROVIDER_NAME_OPTION;
-	label: string;
+	name: string;
 	isConfigured: boolean;
 	isSelected: boolean;
 	credentialCount: number;
@@ -138,25 +155,9 @@ export interface SmartApiKeyProviderOption {
 export interface SmartOAuthProviderOption {
 	provider: SupportedProviderId;
 	name: string;
-	label: string;
 	isConfigured: boolean;
 	isSelected: boolean;
 	credentialCount: number;
-}
-
-function formatConfiguredCredentialCount(credentialCount: number): string {
-	return `${credentialCount} credential${credentialCount === 1 ? "" : "s"} configured`;
-}
-
-function buildProviderChoiceSuffix(candidate: ProviderChoiceCandidate): string {
-	const hints: string[] = [];
-	if (candidate.isSelected) {
-		hints.push("selected");
-	}
-	if (candidate.credentialCount > 0) {
-		hints.push(formatConfiguredCredentialCount(candidate.credentialCount));
-	}
-	return hints.join(", ");
 }
 
 function compareProviderChoiceCandidates(
@@ -191,42 +192,47 @@ function getCredentialCountsByProvider(
 export function buildSmartApiKeyProviderOptions(
 	providerStatuses: readonly ProviderStatusSummary[],
 	selectedProviderId: SupportedProviderId | null,
+	supportedProviders: readonly SupportedApiKeyProviderSummary[] = [],
 ): SmartApiKeyProviderOption[] {
 	const credentialCounts = getCredentialCountsByProvider(providerStatuses);
 	const seenProviders = new Set<SupportedProviderId>();
 	const candidates: ProviderChoiceCandidate[] = [];
-
-	for (const status of providerStatuses) {
-		const provider = status.provider.trim();
+	const pushCandidate = (providerId: string, displayName: string): void => {
+		const provider = providerId.trim();
 		if (!provider || seenProviders.has(provider)) {
-			continue;
+			return;
 		}
+		const credentialCount = credentialCounts.get(provider) ?? 0;
 		seenProviders.add(provider);
 		candidates.push({
 			provider,
-			displayName: provider,
-			credentialCount: credentialCounts.get(provider) ?? 0,
-			isConfigured: (credentialCounts.get(provider) ?? 0) > 0,
+			displayName: displayName.trim() || provider,
+			credentialCount,
+			isConfigured: credentialCount > 0,
 			isSelected: provider === selectedProviderId,
 		});
+	};
+
+	for (const supportedProvider of supportedProviders) {
+		pushCandidate(supportedProvider.provider, supportedProvider.name ?? supportedProvider.provider);
+	}
+	for (const status of providerStatuses) {
+		pushCandidate(status.provider, status.provider);
 	}
 
 	const options = candidates
 		.sort(compareProviderChoiceCandidates)
-		.map<SmartApiKeyProviderOption>((candidate) => {
-			const suffix = buildProviderChoiceSuffix(candidate);
-			return {
-				provider: candidate.provider,
-				label: suffix ? `${candidate.provider} — ${suffix}` : candidate.provider,
-				isConfigured: candidate.isConfigured,
-				isSelected: candidate.isSelected,
-				credentialCount: candidate.credentialCount,
-			};
-		});
+		.map<SmartApiKeyProviderOption>((candidate) => ({
+			provider: candidate.provider,
+			name: candidate.displayName,
+			isConfigured: candidate.isConfigured,
+			isSelected: candidate.isSelected,
+			credentialCount: candidate.credentialCount,
+		}));
 
 	options.push({
 		provider: CUSTOM_PROVIDER_NAME_OPTION,
-		label: "Use custom provider name…",
+		name: "Use custom provider name…",
 		isConfigured: false,
 		isSelected: false,
 		credentialCount: 0,
@@ -263,19 +269,13 @@ export function buildSmartOAuthProviderOptions(
 
 	return candidates
 		.sort(compareProviderChoiceCandidates)
-		.map<SmartOAuthProviderOption>((candidate) => {
-			const name = names.get(candidate.provider) ?? candidate.provider;
-			const suffix = buildProviderChoiceSuffix(candidate);
-			const baseLabel = `${name} (${candidate.provider})`;
-			return {
-				provider: candidate.provider,
-				name,
-				label: suffix ? `${baseLabel} — ${suffix}` : baseLabel,
-				isConfigured: candidate.isConfigured,
-				isSelected: candidate.isSelected,
-				credentialCount: candidate.credentialCount,
-			};
-		});
+		.map<SmartOAuthProviderOption>((candidate) => ({
+			provider: candidate.provider,
+			name: names.get(candidate.provider) ?? candidate.provider,
+			isConfigured: candidate.isConfigured,
+			isSelected: candidate.isSelected,
+			credentialCount: candidate.credentialCount,
+		}));
 }
 
 export function normalizeProviderSelectionInput(
@@ -405,6 +405,72 @@ function formatProviderLabel(provider: SupportedProviderId): string {
 		default:
 			return provider;
 	}
+}
+
+function normalizePlanLabel(planType: string | null | undefined): string {
+	const normalized = normalizeInlineText(planType ?? "").trim();
+	return normalized || "unknown";
+}
+
+function getPlanHighlightColor(planType: string | null | undefined): PlanHighlightColor {
+	const normalized = normalizePlanLabel(planType).toLowerCase();
+	if (NEUTRAL_PLAN_LABELS.has(normalized)) {
+		return "text";
+	}
+	if (normalized.includes("enterprise") || normalized.includes("business")) {
+		return "toolTitle";
+	}
+	if (normalized.includes("team")) {
+		return "warning";
+	}
+	if (
+		normalized.includes("pro") ||
+		normalized.includes("max") ||
+		normalized.includes("unlimited") ||
+		normalized.includes("advanced")
+	) {
+		return "accent";
+	}
+	if (
+		normalized.includes("plus") ||
+		normalized.includes("premium") ||
+		normalized.includes("paid") ||
+		normalized.includes("code assist") ||
+		normalized.includes("copilot")
+	) {
+		return "success";
+	}
+	return "mdLink";
+}
+
+function formatPlanDetailLabel(planType: string | null | undefined, displayOnly: boolean): string {
+	const label = normalizePlanLabel(planType);
+	return displayOnly ? `${label} (last known)` : label;
+}
+
+function resolveAccountColumnWidths(contentWidth: number): AccountColumnWidths | null {
+	const safeWidth = Math.max(1, Math.floor(contentWidth));
+	if (safeWidth < ACCOUNT_TABLE_MIN_WIDTH) {
+		return null;
+	}
+
+	const availableColumns = safeWidth - ACCOUNT_ROW_PREFIX_WIDTH;
+	const alias = clamp(Math.floor(safeWidth * 0.28), 8, Math.min(16, availableColumns - 9));
+	const account = availableColumns - alias - 1;
+	if (account < 8) {
+		return null;
+	}
+	return { alias, account };
+}
+
+function getCredentialAlias(credential: CredentialStatus): string {
+	return normalizeInlineText(credential.credentialId).trim() || "account";
+}
+
+function getCredentialAccountLabel(credential: CredentialStatus): string {
+	const credentialId = normalizeInlineText(credential.credentialId).trim();
+	const friendlyName = normalizeInlineText(credential.friendlyName ?? "").trim();
+	return friendlyName && friendlyName !== credentialId ? friendlyName : "";
 }
 
 function renderProgressBar(percentUsed: number | null, width: number): string {
@@ -983,8 +1049,10 @@ class MultiAuthManagerModal {
 		const accountProviderLabel = selectedProviderStatus
 			? formatProviderLabel(selectedProviderStatus.provider)
 			: "none";
-		const disabledViewLabel = this.showDisabledAccounts ? "all" : "active";
-		const accountTitleText = `Accounts: ${accountProviderLabel} (${disabledViewLabel})`;
+		const accountCountLabel = selectedProviderStatus
+			? this.getVisibleCredentials(selectedProviderStatus).length.toString()
+			: "0";
+		const accountTitleText = `Accounts: ${accountProviderLabel} (${accountCountLabel})`;
 		const accountHeaderCell = renderGridCell(accountTitleText, widths.accounts);
 		const detailsHeaderCell = renderGridCell("Account Details", widths.details);
 		const providerTitle =
@@ -1044,8 +1112,10 @@ class MultiAuthManagerModal {
 		const providerLabel = selectedProviderStatus
 			? formatProviderLabel(selectedProviderStatus.provider)
 			: "none";
-		const disabledViewLabel = this.showDisabledAccounts ? "all" : "active";
-		rows.push(this.theme.fg("dim", `Accounts: ${providerLabel} (${disabledViewLabel})`));
+		const accountCountLabel = selectedProviderStatus
+			? this.getVisibleCredentials(selectedProviderStatus).length.toString()
+			: "0";
+		rows.push(this.theme.fg("dim", `Accounts: ${providerLabel} (${accountCountLabel})`));
 		for (const line of this.buildAccountsPaneLines(selectedProviderStatus, width)) {
 			rows.push(line);
 		}
@@ -1101,25 +1171,54 @@ class MultiAuthManagerModal {
 		isSelected: boolean,
 		isMarked: boolean,
 	): string[] {
-		const state = this.getCredentialState(credential);
-		const cursor = isSelected ? "▶" : " ";
-		const mark = isMarked ? "*" : " ";
-		const authLabel = credential.credentialType === "api_key" ? "KEY" : "OAUTH";
-		const prefix =
-			contentWidth < 24
-				? `${cursor}${mark} ${state.symbol} `
-				: `${cursor}${mark} ${state.symbol} [${state.label}/${authLabel}] `;
-		const identifierWidth = Math.max(1, contentWidth - visibleWidth(prefix));
-		const displayName = formatCredentialDisplayName(credential.credentialId, credential.friendlyName);
-		const labelLines = wrapAccountDisplayNameLines(displayName, identifierWidth);
-		const continuationPrefix = " ".repeat(visibleWidth(prefix));
-		const lines = labelLines.map((labelLine, lineIndex) =>
-			padRight(`${lineIndex === 0 ? prefix : continuationPrefix}${labelLine}`, contentWidth),
-		);
-		if (state.label !== "Exhaust") {
-			return lines;
+		const columnWidths = resolveAccountColumnWidths(contentWidth);
+		if (!columnWidths) {
+			return this.buildCompactAccountEntryLines(credential, contentWidth, isSelected, isMarked);
 		}
-		return lines.map((line) => this.theme.fg("dim", line));
+
+		const cursor = isSelected ? "▶" : " ";
+		const activeMarker = isMarked || credential.isManualActive ? "*" : " ";
+		const statusCell = this.getAccountStatusCell(credential);
+		const alias = this.colorizePlanText(
+			padRight(getCredentialAlias(credential), columnWidths.alias),
+			credential.usageSnapshot?.planType,
+		);
+		const accountLines = wrapAccountDisplayNameLines(
+			getCredentialAccountLabel(credential),
+			columnWidths.account,
+		);
+		const firstPrefix = `${cursor} ${activeMarker} ${statusCell} `;
+		const continuationPrefix = `${" ".repeat(ACCOUNT_ROW_PREFIX_WIDTH + columnWidths.alias)} `;
+		return accountLines.map((accountLine, lineIndex) => {
+			if (lineIndex === 0) {
+				const accountSuffix = accountLine ? ` ${accountLine}` : "";
+				return padRight(`${firstPrefix}${alias}${accountSuffix}`, contentWidth);
+			}
+			return padRight(`${continuationPrefix}${accountLine}`, contentWidth);
+		});
+	}
+
+	private buildCompactAccountEntryLines(
+		credential: CredentialStatus,
+		contentWidth: number,
+		isSelected: boolean,
+		isMarked: boolean,
+	): string[] {
+		const cursor = isSelected ? "▶" : " ";
+		const activeMarker = isMarked || credential.isManualActive ? "*" : " ";
+		const statusCell = this.getAccountStatusCell(credential);
+		const alias = this.colorizePlanText(getCredentialAlias(credential), credential.usageSnapshot?.planType);
+		const prefix = `${cursor} ${activeMarker} ${statusCell} ${alias}`;
+		const accountWidth = Math.max(1, contentWidth - visibleWidth(prefix) - 1);
+		const accountLines = wrapAccountDisplayNameLines(getCredentialAccountLabel(credential), accountWidth);
+		const continuationPrefix = " ".repeat(visibleWidth(prefix) + 1);
+		return accountLines.map((accountLine, lineIndex) => {
+			if (lineIndex === 0) {
+				const accountSuffix = accountLine ? ` ${accountLine}` : "";
+				return padRight(`${prefix}${accountSuffix}`, contentWidth);
+			}
+			return padRight(`${continuationPrefix}${accountLine}`, contentWidth);
+		});
 	}
 
 	private buildAccountsPaneLines(status: ProviderStatus | null, columnWidth: number): string[] {
@@ -1217,10 +1316,11 @@ class MultiAuthManagerModal {
 		const selectedCredential = selectedEntry.credential;
 		const batchSelectionCount = this.getBatchSelectedCredentialIds(status).length;
 		const state = this.getCredentialState(selectedCredential);
-		const planType = selectedCredential.usageSnapshot?.planType ?? "unknown";
-		const planLabel = selectedCredential.usageSnapshotDisplayOnly
-			? `${planType} (last known)`
-			: planType;
+		const planType = selectedCredential.usageSnapshot?.planType;
+		const planLabel = this.colorizePlanText(
+			formatPlanDetailLabel(planType, Boolean(selectedCredential.usageSnapshotDisplayOnly)),
+			planType,
+		);
 		const selectionMode = selectedCredential.isManualActive
 			? "Manual active (persists across sessions/restarts)"
 			: "Automatic";
@@ -1361,6 +1461,17 @@ class MultiAuthManagerModal {
 			lines.push("Usage unavailable");
 		}
 		return lines;
+	}
+
+	private colorizePlanText(text: string, planType: string | null | undefined): string {
+		return this.theme.fg(getPlanHighlightColor(planType), text);
+	}
+
+	private getAccountStatusCell(credential: CredentialStatus): string {
+		const state = this.getCredentialState(credential);
+		return state.label === "Ready" || state.label === "Active" || state.label === "Manual"
+			? "[●]"
+			: "[○]";
 	}
 
 	private getCredentialState(credential: CredentialStatus): { symbol: string; label: string } {
@@ -1704,14 +1815,21 @@ class MultiAuthManagerModal {
 		if (options.length === 0) {
 			throw new Error("No OAuth providers are currently available.");
 		}
-		const pickedLabel = await this.ctx.ui.select(
-			"Choose provider to add via OAuth login",
-			options.map((option) => option.label),
-		);
-		if (!pickedLabel) {
+		const pickedProvider = await runProviderConfigurationDialog(this.ctx, {
+			mode: "oauth",
+			selectedProvider,
+			options: options.map((option) => ({
+				provider: option.provider,
+				name: option.name,
+				isConfigured: option.isConfigured,
+				isSelected: option.isSelected,
+				credentialCount: option.credentialCount,
+			})),
+		});
+		if (!pickedProvider) {
 			return null;
 		}
-		const selectedOption = options.find((option) => option.label === pickedLabel);
+		const selectedOption = options.find((option) => option.provider === pickedProvider);
 		if (!selectedOption) {
 			throw new Error("Selected OAuth provider is no longer available.");
 		}
@@ -1721,26 +1839,42 @@ class MultiAuthManagerModal {
 	private async promptForApiKeyProviderSelection(
 		selectedProvider: SupportedProviderId,
 	): Promise<SupportedProviderId | null> {
-		const options = buildSmartApiKeyProviderOptions(this.statuses, selectedProvider);
-		const pickedLabel = await this.ctx.ui.select(
-			"Choose provider to add via API key",
-			options.map((option) => option.label),
+		const supportedProviders = await this.accountManager.getAvailableApiKeyProviders();
+		const options = buildSmartApiKeyProviderOptions(
+			this.statuses,
+			selectedProvider,
+			supportedProviders,
 		);
-		if (!pickedLabel) {
+		const pickedProvider = await runProviderConfigurationDialog(this.ctx, {
+			mode: "api_key",
+			selectedProvider,
+			options: options.map((option) => ({
+				provider: option.provider,
+				name: option.name,
+				isConfigured: option.isConfigured,
+				isSelected: option.isSelected,
+				credentialCount: option.credentialCount,
+			})),
+		});
+		if (!pickedProvider) {
 			return null;
 		}
-		const selectedOption = options.find((option) => option.label === pickedLabel);
+		const selectedOption = options.find((option) => option.provider === pickedProvider);
 		if (!selectedOption) {
 			throw new Error("Selected provider is no longer available.");
 		}
 		if (selectedOption.provider !== CUSTOM_PROVIDER_NAME_OPTION) {
 			return selectedOption.provider;
 		}
-		return this.promptForCustomApiKeyProvider(selectedProvider);
+		const knownProviderIds = options
+			.map((option) => option.provider)
+			.filter((provider): provider is SupportedProviderId => provider !== CUSTOM_PROVIDER_NAME_OPTION);
+		return this.promptForCustomApiKeyProvider(selectedProvider, knownProviderIds);
 	}
 
 	private async promptForCustomApiKeyProvider(
 		selectedProvider: SupportedProviderId,
+		knownProviderIds: readonly SupportedProviderId[] = this.getKnownProviderIds(),
 	): Promise<SupportedProviderId | null> {
 		const providerInput = await this.ctx.ui.input(
 			"Enter custom provider name:",
@@ -1751,7 +1885,7 @@ class MultiAuthManagerModal {
 		}
 		const normalizedProvider = normalizeProviderSelectionInput(
 			providerInput,
-			this.getKnownProviderIds(),
+			this.getKnownProviderIds(knownProviderIds),
 		);
 		if (!normalizedProvider.ok) {
 			throw new Error(normalizedProvider.message);
@@ -1759,7 +1893,7 @@ class MultiAuthManagerModal {
 		return normalizedProvider.value;
 	}
 
-	private getKnownProviderIds(): SupportedProviderId[] {
+	private getKnownProviderIds(extraProviderIds: readonly SupportedProviderId[] = []): SupportedProviderId[] {
 		const orderedProviders: SupportedProviderId[] = [];
 		const pushUnique = (provider: SupportedProviderId): void => {
 			if (!provider || orderedProviders.includes(provider)) {
@@ -1772,6 +1906,9 @@ class MultiAuthManagerModal {
 		}
 		for (const provider of this.accountManager.getAvailableOAuthProviders()) {
 			pushUnique(provider.provider);
+		}
+		for (const provider of extraProviderIds) {
+			pushUnique(provider);
 		}
 		return orderedProviders;
 	}

@@ -72,6 +72,7 @@ import {
 } from "./credential-display.js";
 import {
 	ProviderRegistry,
+	type AvailableApiKeyProvider,
 	type AvailableOAuthProvider,
 	type ProviderCapabilities,
 } from "./provider-registry.js";
@@ -1503,6 +1504,13 @@ export class AccountManager {
 			return;
 		}
 		await this.lightweightRotationState.flushAll();
+	}
+
+	/**
+	 * Returns API-key providers available from pi-mono parity, models.json, and auth.json.
+	 */
+	async getAvailableApiKeyProviders(): Promise<readonly AvailableApiKeyProvider[]> {
+		return this.providerRegistry.listAvailableApiKeyProviders();
 	}
 
 	/**
