@@ -1,6 +1,6 @@
 {
   "name": "pi-multi-auth",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Pi extension for multi-provider credential management, OAuth login, and account rotation.",
   "type": "module",
   "main": "./index.ts",
@@ -73,9 +73,9 @@
     "@mariozechner/pi-tui": "^0.70.0"
   },
   "devDependencies": {
-    "@mariozechner/pi-ai": "^0.70.5",
-    "@mariozechner/pi-coding-agent": "^0.70.5",
-    "@mariozechner/pi-tui": "^0.70.5",
+    "@mariozechner/pi-ai": "^0.70.6",
+    "@mariozechner/pi-coding-agent": "^0.70.6",
+    "@mariozechner/pi-tui": "^0.70.6",
     "@types/node": "^25.6.0",
     "@types/proper-lockfile": "^4.1.4",
     "typescript": "^6.0.3"

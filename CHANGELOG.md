@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.6.0 - 2026-04-30
+
+### Added
+- Added a guided provider configuration dialog for API-key and OAuth setup that separates configured and available providers, supports search, and preserves credential-count context.
+- Added API-key provider discovery from Pi built-ins, `models.json`, and known `auth.json` credentials so supported providers can be selected before credentials exist.
+- Added delegated credential pinning for parent-session credential reuse with explicit unavailable and model-entitlement diagnostics.
+
+### Changed
+- Refined the account manager modal to show visible account counts, alias/account columns, and color-highlighted plan details.
+- Updated Cloudflare Workers AI daily allocation classification to infer UTC reset windows and reconcile persisted cooldown state from saved quota errors.
+- Updated Pi development dependencies and lockfile entries to `0.70.6` for release preparation.
+
 ## 0.5.0 - 2026-04-28
 
 ### Changed
