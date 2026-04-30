@@ -528,7 +528,7 @@ function formatMultiAuthRotationFailureMessage(
 	model: Model<Api>,
 	errorMessage: string,
 ): string {
-	if (/^All credentials are unavailable\b/i.test(errorMessage.trim())) {
+	if (/^(?:All credentials are unavailable|Delegated credential)\b/i.test(errorMessage.trim())) {
 		return errorMessage;
 	}
 
@@ -687,6 +687,7 @@ export function createRotatingStreamWrapper(
 
 						selected = await accountManager.acquireCredential(activeProviderId, {
 							excludedCredentialIds: pinnedExcludedCredentialIds,
+							pinnedCredentialId: delegatedCredentialOverride.credentialId,
 							modelId: activeModel.id,
 							selectionCache,
 							signal: options?.signal,

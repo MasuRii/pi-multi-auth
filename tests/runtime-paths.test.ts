@@ -35,7 +35,7 @@ async function withEnv<T>(
 	}
 }
 
-test("pi-multi-auth uses PI_CODING_AGENT_DIR for delegated runtime state", async () => {
+test("pi-multi-auth uses PI_MULTI_AUTH_RUNTIME_DIR for delegated runtime state", async () => {
 	const tmpHome = mkdtempSync(join(tmpdir(), "pi-multi-auth-home-"));
 	const runtimeRoot = mkdtempSync(join(tmpdir(), "pi-multi-auth-runtime-"));
 	const runtimeModelsPath = join(runtimeRoot, "models.json");
@@ -65,6 +65,7 @@ test("pi-multi-auth uses PI_CODING_AGENT_DIR for delegated runtime state", async
 			HOME: tmpHome,
 			USERPROFILE: tmpHome,
 			PI_CODING_AGENT_DIR: runtimeRoot,
+			PI_MULTI_AUTH_RUNTIME_DIR: runtimeRoot,
 		},
 		async () => {
 			const authWriter = new AuthWriter();
@@ -123,6 +124,7 @@ test("pi-multi-auth falls back to HOME-based runtime paths without isolation", a
 			HOME: tmpHome,
 			USERPROFILE: tmpHome,
 			PI_CODING_AGENT_DIR: undefined,
+			PI_MULTI_AUTH_RUNTIME_DIR: undefined,
 		},
 		async () => {
 			const authWriter = new AuthWriter();

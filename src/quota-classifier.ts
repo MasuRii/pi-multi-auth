@@ -19,6 +19,9 @@ const MESSAGE_PATTERNS: Record<QuotaClassification, RegExp[]> = {
 	],
 	daily: [
 		/daily.?limit/i,
+		/daily.?free.?allocation/i,
+		/used.?up.?your.?daily/i,
+		/neurons?.*per.?day/i,
 		/per.?day/i,
 		/24.?hour/i,
 		/try.?again.?tomorrow/i,
@@ -54,8 +57,28 @@ const MESSAGE_PATTERNS: Record<QuotaClassification, RegExp[]> = {
 	unknown: [],
 };
 
+const CLOUDFLARE_DAILY_RESET_PATTERNS: RegExp[] = [
+	/daily.?free.?allocation/i,
+	/used.?up.?your.?daily/i,
+	/\b10,?000\s+neurons\b/i,
+	/cloudflare(?:'s)?\s+workers\s+paid\s+plan/i,
+];
+
 function matchesAny(message: string, patterns: readonly RegExp[]): boolean {
 	return patterns.some((pattern) => pattern.test(message));
+}
+
+function getNextUtcMidnightMs(now: number = Date.now()): number {
+	const date = new Date(now);
+	return Date.UTC(
+		date.getUTCFullYear(),
+		date.getUTCMonth(),
+		date.getUTCDate() + 1,
+		0,
+		0,
+		0,
+		0,
+	);
 }
 
 function buildQuotaWindow(
@@ -99,6 +122,28 @@ function cooldownFor(classification: QuotaClassification): number {
 
 function recoveryActionFor(classification: QuotaClassification): RecoveryAction {
 	return { ...QUOTA_RECOVERY_ACTIONS[classification] };
+}
+
+function recoveryActionWithEstimatedWait(
+	classification: QuotaClassification,
+	estimatedWaitMs: number | undefined,
+): RecoveryAction {
+	const action = recoveryActionFor(classification);
+	if (typeof estimatedWaitMs === "number" && Number.isFinite(estimatedWaitMs)) {
+		return { ...action, estimatedWaitMs };
+	}
+	return action;
+}
+
+function inferMessageQuotaWindow(
+	classification: QuotaClassification,
+	message: string,
+	now: number = Date.now(),
+): QuotaWindow | undefined {
+	if (classification === "daily" && matchesAny(message, CLOUDFLARE_DAILY_RESET_PATTERNS)) {
+		return buildQuotaWindow(classification, getNextUtcMidnightMs(now), now);
+	}
+	return undefined;
 }
 
 function inferClassificationFromWindow(window: RateLimitWindow | null): QuotaClassification {
@@ -177,10 +222,17 @@ export class QuotaClassifier {
 			"hourly",
 		] as const) {
 			if (matchesAny(normalizedMessage, MESSAGE_PATTERNS[classification])) {
+				const now = Date.now();
+				const window = inferMessageQuotaWindow(classification, normalizedMessage, now);
+				const cooldownMs = window?.resetInMs ?? cooldownFor(classification);
 				return {
 					classification,
-					cooldownMs: cooldownFor(classification),
-					recoveryAction: recoveryActionFor(classification),
+					window,
+					cooldownMs,
+					recoveryAction: recoveryActionWithEstimatedWait(
+						classification,
+						window?.resetInMs,
+					),
 					confidence: classification === "hourly" ? "medium" : "high",
 					source: "message",
 				};

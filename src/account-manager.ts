@@ -225,8 +225,18 @@ function formatCredentialIdList(credentialIds: readonly string[]): string {
 	return credentialIds.map((credentialId) => `'${credentialId}'`).join(", ");
 }
 
+function normalizeOptionalCredentialId(credentialId: string | undefined): string | undefined {
+	if (typeof credentialId !== "string") {
+		return undefined;
+	}
+
+	const normalizedCredentialId = credentialId.trim();
+	return normalizedCredentialId.length > 0 ? normalizedCredentialId : undefined;
+}
+
 type AcquireCredentialOptions = {
 	excludedCredentialIds?: Set<string>;
+	pinnedCredentialId?: string;
 	modelId?: string;
 	selectionCache?: CredentialSelectionCache;
 	signal?: AbortSignal;
@@ -751,6 +761,38 @@ function applyCredentialNormalization(
 	normalizeProviderState(state);
 }
 
+function reconcileActiveQuotaCooldownsFromPersistedErrors(
+	state: ProviderRotationState,
+	validIds: ReadonlySet<string>,
+	now: number = Date.now(),
+): void {
+	for (const credentialId of validIds) {
+		const currentUntil = state.quotaExhaustedUntil[credentialId];
+		if (typeof currentUntil !== "number" || currentUntil <= now) {
+			continue;
+		}
+
+		const errorMessage = state.lastQuotaError[credentialId]?.trim();
+		if (!errorMessage) {
+			continue;
+		}
+
+		const classification = quotaClassifier.classifyFromMessage(errorMessage);
+		const windowEndMs = classification.window?.windowEndMs;
+		if (typeof windowEndMs !== "number" || windowEndMs <= currentUntil) {
+			continue;
+		}
+
+		const nextUntil = Math.max(windowEndMs, now + MIN_QUOTA_RETRY_WINDOW_MS);
+		state.quotaExhaustedUntil[credentialId] = nextUntil;
+		state.quotaStates = state.quotaStates ?? {};
+		state.quotaStates[credentialId] = {
+			...quotaClassifier.createQuotaState(credentialId, errorMessage, classification, now),
+			resetAt: nextUntil,
+		};
+	}
+}
+
 function normalizeProviderState(state: ProviderRotationState): void {
 	const validIds = new Set(state.credentialIds);
 
@@ -814,6 +856,7 @@ function normalizeProviderState(state: ProviderRotationState): void {
 	}
 
 	keepOnlyValidNumericKeys(state.oauthRefreshScheduled ?? {});
+	reconcileActiveQuotaCooldownsFromPersistedErrors(state, validIds);
 
 	if (state.cascadeState) {
 		for (const providerId of Object.keys(state.cascadeState)) {
@@ -1062,6 +1105,42 @@ function formatUnavailableCredentialReason(
 		lines: [`- ${credentialId}: unavailable`],
 		actionKind: "unknown",
 	};
+}
+
+function formatDelegatedCredentialUnavailableMessage(
+	provider: SupportedProviderId,
+	state: ProviderRotationState,
+	credentialId: string,
+	expiredApiKeyCredentialIds: ReadonlySet<string>,
+	effectiveExcludedCredentialIds: ReadonlySet<string>,
+	requestedModelId: string | undefined,
+): string {
+	const now = Date.now();
+	const reason = formatUnavailableCredentialReason(
+		provider,
+		state,
+		credentialId,
+		now,
+		expiredApiKeyCredentialIds,
+		effectiveExcludedCredentialIds,
+	);
+	const action = reason.actionKind
+		? describeCredentialErrorAction(reason.actionKind)
+		: "Ask the parent router to retry with another delegated credential or resolve the credential state in /multi-auth.";
+	const lines = [
+		"Delegated credential is unavailable",
+		`Provider: ${provider}`,
+	];
+	if (requestedModelId) {
+		lines.push(`Model: ${requestedModelId}`);
+	}
+	lines.push(
+		`Credential: ${credentialId}`,
+		"Credential status:",
+		...reason.lines,
+		`Action: ${action}`,
+	);
+	return lines.join("\n");
 }
 
 function formatAllCredentialsUnavailableMessage(
@@ -2983,6 +3062,13 @@ export class AccountManager {
 			}
 		}
 
+		const pinnedCredentialId = normalizeOptionalCredentialId(options?.pinnedCredentialId);
+		if (pinnedCredentialId && !state.credentialIds.includes(pinnedCredentialId)) {
+			throw new Error(
+				`Delegated credential '${pinnedCredentialId}' is not available for ${provider}.`,
+			);
+		}
+
 		const effectiveExcludedCredentialIds = new Set(options?.excludedCredentialIds ?? []);
 		for (const disabledCredentialId of disabledCredentialIds) {
 			effectiveExcludedCredentialIds.add(disabledCredentialId);
@@ -3020,7 +3106,38 @@ export class AccountManager {
 			throw new Error(modelEligibility.failureMessage);
 		}
 
-		if (effectiveExcludedCredentialIds.size >= state.credentialIds.length) {
+		let selectedIndex: number | undefined;
+		let selectedRotationMode: RotationMode | undefined;
+		let selectedPoolState: ProviderPoolState | undefined;
+		if (pinnedCredentialId) {
+			selectedIndex = state.credentialIds.indexOf(pinnedCredentialId);
+			if (
+				modelEligibility.appliesConstraint &&
+				modelEligibility.ineligibleCredentialIds.includes(pinnedCredentialId) &&
+				requestedModelId !== undefined
+			) {
+				throw new Error(
+					`Delegated credential '${pinnedCredentialId}' for ${provider} is not eligible for ${formatModelReference(provider, requestedModelId)}. Ask the parent router to retry with another delegated credential or choose an entitled account in /multi-auth.`,
+				);
+			}
+
+			const exhaustedUntil = state.quotaExhaustedUntil[pinnedCredentialId];
+			if (
+				effectiveExcludedCredentialIds.has(pinnedCredentialId) ||
+				(typeof exhaustedUntil === "number" && exhaustedUntil > Date.now())
+			) {
+				throw new Error(
+					formatDelegatedCredentialUnavailableMessage(
+						provider,
+						state,
+						pinnedCredentialId,
+						expiredApiKeyCredentialIds,
+						effectiveExcludedCredentialIds,
+						requestedModelId,
+					),
+				);
+			}
+		} else if (effectiveExcludedCredentialIds.size >= state.credentialIds.length) {
 			if (expiredApiKeyCredentialIds.size === state.credentialIds.length) {
 				throw new Error(
 					`All credentials for ${provider} are expired WorkOS session tokens. Re-authenticate the account in /multi-auth.`,
@@ -3037,10 +3154,7 @@ export class AccountManager {
 			);
 		}
 
-		const manualCredentialId = state.manualActiveCredentialId;
-		let selectedIndex: number | undefined;
-		let selectedRotationMode: RotationMode | undefined;
-		let selectedPoolState: ProviderPoolState | undefined;
+		const manualCredentialId = pinnedCredentialId ? undefined : state.manualActiveCredentialId;
 		if (manualCredentialId) {
 			if (
 				modelEligibility.appliesConstraint &&
@@ -3236,7 +3350,7 @@ export class AccountManager {
 		throwIfAborted(options?.signal, `Credential acquisition aborted for ${provider}.`);
 
 		const selectedAt = Date.now();
-		const hasSelectionExclusions = effectiveExcludedCredentialIds.size > 0;
+		const hasSelectionExclusions = effectiveExcludedCredentialIds.size > 0 || pinnedCredentialId !== undefined;
 		const nextRoundRobinIndex =
 			state.credentialIds.length > 0 ? (selectedIndex + 1) % state.credentialIds.length : selectedIndex;
 		const nextActiveIndex = state.manualActiveCredentialId
