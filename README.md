@@ -12,10 +12,11 @@
 ## Capabilities
 
 - Wraps discovered Pi providers with multi-account rotation, quota-aware cooldowns, failover, health scoring, and optional pool selection.
-- Supports OAuth credential management for providers exposed by Pi and registers first-class Cline OAuth login and refresh handling.
-- Applies per-credential request overrides for provider base URLs and headers, with Cloudflare Workers AI credentials using account-scoped OpenAI-compatible base URLs.
+- Supports OAuth credential management for providers exposed by Pi and registers first-class Cline and Kilo OAuth login and refresh handling.
+- Applies per-credential request overrides for provider base URLs and headers, with Cloudflare Workers AI credentials using account-scoped OpenAI-compatible base URLs and token/account discovery during credential setup.
 - Enriches status-only provider failures with bounded diagnostic probes so authentication, permission, billing, and rate-limit errors include actionable provider response details when available.
 - Provides lightweight rotation for API-key providers that do not expose external usage state, including delegated parent-session lease reuse.
+- Filters removed legacy Google Gemini CLI and Google Antigravity providers so stale provider definitions are not offered for credential setup or usage refreshes.
 - Persists extension state and usage snapshots under Pi's runtime directory while keeping local `config.json` and debug output outside the published package.
 - Coordinates fresh usage refreshes across selection, startup, modal, and manual refresh flows with bounded concurrency, candidate windows, cooldowns, and circuit breaking.
 
@@ -89,7 +90,7 @@ Credentials may include a `request` object with provider-specific request settin
 | `request.baseUrl` | `string` | Overrides the model base URL for that credential after URL validation |
 | `request.headers` | `Record<string, string>` | Adds credential-scoped headers to the provider request |
 
-Cloudflare Workers AI credentials must use `https://api.cloudflare.com/client/v4/accounts/<account_id>/ai/v1` as the OpenAI-compatible base URL. When adding a Cloudflare API-key credential, the extension discovers this URL automatically if the token can list exactly one account; otherwise add `request.baseUrl` manually for the intended account.
+Cloudflare Workers AI credentials must use `https://api.cloudflare.com/client/v4/accounts/<account_id>/ai/v1` as the OpenAI-compatible base URL. When adding a Cloudflare API-key credential, the extension can extract `cfat_` tokens, account IDs, dashboard token URLs, or full Workers AI base URLs from pasted input. It discovers the base URL automatically when the token can list exactly one account; otherwise add `request.baseUrl` manually for the intended account.
 
 ## Validation
 
