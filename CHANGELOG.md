@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.7.0 - 2026-05-04
+
+### Added
+- Added first-class Kilo OAuth device authorization, refresh handling, and Kilo editor request headers for model calls.
+- Added Cloudflare Workers AI credential parsing for pasted `cfat_` tokens, account IDs, dashboard token URLs, and full account-scoped base URLs.
+
+### Changed
+- Updated Cloudflare Workers AI setup to discover account-scoped OpenAI-compatible base URLs when a token can list exactly one account, with actionable fallback guidance when manual selection is required.
+- Removed legacy Google Gemini CLI and Google Antigravity provider handling from usage refresh and credential setup paths.
+- Updated package metadata and lockfile version to `0.7.0` for release preparation.
+
+### Fixed
+- Improved Cloudflare credential identity resolution so existing credentials can derive account context from request overrides or token discovery instead of relying on stale provider metadata.
+
 ## 0.6.0 - 2026-04-30
 
 ### Added
