@@ -21,12 +21,12 @@
   "scripts": {
     "build": "npm run typecheck",
     "typecheck": "tsc -p tsconfig.json",
-    "lint": "node scripts/run-lint.mjs",
+    "lint": "eslint \"index.ts\" \"src/**/*.ts\" \"tests/**/*.ts\" --format json --max-warnings 0",
     "test:clean": "node -e \"require('node:fs').rmSync('.test-dist', { recursive: true, force: true })\"",
     "pretest": "npm run test:clean",
     "test": "tsc -p tsconfig.test.json && node scripts/run-compiled-tests.mjs",
     "posttest": "npm run test:clean",
-    "check": "npm run typecheck && npm run test"
+    "check": "npm run typecheck && npm run lint && npm run test"
   },
   "keywords": [
     "pi-package",
@@ -68,16 +68,20 @@
     "proper-lockfile": "^4.1.2"
   },
   "peerDependencies": {
-    "@mariozechner/pi-ai": "^0.70.0",
-    "@mariozechner/pi-coding-agent": "^0.70.0",
-    "@mariozechner/pi-tui": "^0.70.0"
+    "@mariozechner/pi-ai": "^0.72.0",
+    "@mariozechner/pi-coding-agent": "^0.72.0",
+    "@mariozechner/pi-tui": "^0.72.0"
   },
   "devDependencies": {
-    "@mariozechner/pi-ai": "^0.70.6",
-    "@mariozechner/pi-coding-agent": "^0.70.6",
-    "@mariozechner/pi-tui": "^0.70.6",
+    "@eslint/js": "^10.0.1",
+    "@mariozechner/pi-ai": "^0.72.0",
+    "@mariozechner/pi-coding-agent": "^0.72.0",
+    "@mariozechner/pi-tui": "^0.72.0",
     "@types/node": "^25.6.0",
     "@types/proper-lockfile": "^4.1.4",
-    "typescript": "^6.0.3"
+    "eslint": "^10.3.0",
+    "globals": "^17.6.0",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.59.1"
   }
 }
