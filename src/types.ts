@@ -1,4 +1,4 @@
-import type { Api, AssistantMessage } from "@mariozechner/pi-ai";
+import type { Api, AssistantMessage, Model } from "@mariozechner/pi-ai";
 import type { OAuthCredentials } from "./oauth-compat.js";
 import type { ProviderCascadeState } from "./types-cascade.js";
 import type { FailoverChain, FailoverChainState } from "./types-failover.js";
@@ -14,8 +14,6 @@ export const LEGACY_SUPPORTED_PROVIDERS = [
 	"openai-codex",
 	"github-copilot",
 	"anthropic",
-	"google-gemini-cli",
-	"google-antigravity",
 ] as const;
 
 /** Provider IDs handled by pi-multi-auth. */
@@ -53,6 +51,13 @@ export type StoredAuthCredential = StoredOAuthCredential | StoredApiKeyCredentia
 /** Full auth.json structure. */
 export type AuthFileData = Record<string, StoredAuthCredential>;
 
+export interface ModelCredentialIncompatibilityState {
+	modelId: string;
+	blockedUntil: number;
+	blockedAt: number;
+	error: string;
+}
+
 /** Per-provider rotation state persisted in multi-auth.json. */
 export interface ProviderRotationState {
 	credentialIds: string[];
@@ -76,7 +81,7 @@ export interface ProviderRotationState {
 	 * Key is credentialId, value contains the error message and timestamp when disabled.
 	 * Used for balance exhaustion and other unrecoverable errors.
 	 */
-	disabledCredentials: Record<string, { error: string; disabledAt: number }>;
+	disabledCredentials: Record<string, { error: string; disabledAt: number; planType?: string }>;
 	/** Persisted cascade retry state keyed by provider ID. */
 	cascadeState?: Record<string, ProviderCascadeState>;
 	/** Persisted credential health scores and request history. */
@@ -95,6 +100,8 @@ export interface ProviderRotationState {
 	activeChain?: FailoverChainState;
 	/** Richer quota classifications keyed by credential ID. */
 	quotaStates?: Record<string, QuotaStateForCredential>;
+	/** Temporary per-model credential incompatibilities keyed by credential ID then normalized model ID. */
+	modelIncompatibilities?: Record<string, Record<string, ModelCredentialIncompatibilityState>>;
 }
 
 /** UI preferences persisted in multi-auth.json. */
@@ -165,7 +172,9 @@ export interface ProviderModelDefinition {
 	id: string;
 	name: string;
 	api?: Api;
+	baseUrl?: string;
 	reasoning: boolean;
+	thinkingLevelMap?: Model<Api>["thinkingLevelMap"];
 	input: ("text" | "image")[];
 	cost: {
 		input: number;

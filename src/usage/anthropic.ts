@@ -1,6 +1,7 @@
 import { quotaClassifier } from "../quota-classifier.js";
 import { headersToRecord, rateLimitHeaderParser } from "../rate-limit-headers.js";
 import type { RateLimitWindow, UsageAuth, UsageProvider, UsageSnapshot } from "./types.js";
+import { isRecord } from "../auth-error-utils.js";
 
 const ANTHROPIC_USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage";
 const ANTHROPIC_OAUTH_BETA_HEADER = "oauth-2025-04-20";
@@ -15,9 +16,6 @@ interface AnthropicUsageResponse {
 	seven_day?: AnthropicUsageWindow;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function parseTimestamp(value: unknown): number | null {
 	if (typeof value !== "string" || value.trim().length === 0) {

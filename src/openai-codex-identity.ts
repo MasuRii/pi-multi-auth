@@ -1,3 +1,5 @@
+import { isRecord } from "./auth-error-utils.js";
+
 const OPENAI_AUTH_CLAIM_KEY = "https://api.openai.com/auth";
 const OPENAI_PROFILE_CLAIM_KEY = "https://api.openai.com/profile";
 
@@ -12,9 +14,6 @@ export interface CodexCredentialIdentity {
 	accountId: string | null;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function asNonEmptyString(value: unknown): string | null {
 	if (typeof value !== "string") {

@@ -24,17 +24,13 @@ export interface CredentialModelEligibility {
 	failureMessage?: string;
 }
 
-const OPENAI_CODEX_FREE_PREFERRED_MODEL_IDS = new Set([
-	"gpt-5.2",
-	"gpt-5.4",
-	"gpt-5.4-mini",
-]);
-const OPENAI_CODEX_PAID_MODEL_IDS = new Set([
+const OPENAI_CODEX_FREE_BLOCKED_MODEL_IDS = new Set([
 	"gpt-5-mini",
 	"gpt-5.3-codex",
+	"gpt-5.5",
 ]);
-const OPENAI_CODEX_PAID_MODEL_PATTERNS: readonly RegExp[] = [
-	/^gpt-5\.(?:[5-9]|\d{2,})(?:-[a-z0-9]+)*$/,
+const OPENAI_CODEX_FREE_BLOCKED_MODEL_PATTERNS: readonly RegExp[] = [
+	/^gpt-(?:[6-9]|\d{2,})(?:[.-][a-z0-9]+)*$/,
 ];
 const OPENAI_CODEX_PAID_PLAN_TYPES = new Set<CodexPlanType>([
 	"plus",
@@ -72,6 +68,17 @@ export function formatModelReference(
 	modelId: string,
 ): string {
 	return `${normalizeProviderId(providerId)}/${modelId}`;
+}
+
+function isCodexGptModel(normalizedModelId: string): boolean {
+	return normalizedModelId.startsWith("gpt-");
+}
+
+function isCodexFreeBlockedModel(normalizedModelId: string): boolean {
+	return (
+		OPENAI_CODEX_FREE_BLOCKED_MODEL_IDS.has(normalizedModelId) ||
+		OPENAI_CODEX_FREE_BLOCKED_MODEL_PATTERNS.some((pattern) => pattern.test(normalizedModelId))
+	);
 }
 
 /**
@@ -117,10 +124,7 @@ export function modelRequiresEntitlement(
 		return false;
 	}
 
-	return (
-		OPENAI_CODEX_PAID_MODEL_IDS.has(normalizedModelId) ||
-		OPENAI_CODEX_PAID_MODEL_PATTERNS.some((pattern) => pattern.test(normalizedModelId))
-	);
+	return isCodexFreeBlockedModel(normalizedModelId);
 }
 
 /**
@@ -135,7 +139,9 @@ export function modelPrefersFreePlan(
 	}
 
 	const normalizedModelId = normalizeModelId(modelId);
-	return normalizedModelId !== null && OPENAI_CODEX_FREE_PREFERRED_MODEL_IDS.has(normalizedModelId);
+	return normalizedModelId !== null &&
+		isCodexGptModel(normalizedModelId) &&
+		!isCodexFreeBlockedModel(normalizedModelId);
 }
 
 /**

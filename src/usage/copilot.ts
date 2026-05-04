@@ -1,3 +1,6 @@
+import { fetchWithTimeout } from "../async-utils.js";
+import { isRecord } from "../auth-error-utils.js";
+
 import type {
 	CopilotQuota,
 	CopilotQuotaBucket,
@@ -43,9 +46,6 @@ interface CopilotInternalUserResponse {
 	};
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function asNumber(value: unknown): number | null {
 	return typeof value === "number" && Number.isFinite(value) ? value : null;
@@ -267,37 +267,21 @@ function getCopilotTokenCandidates(auth: UsageAuth): string[] {
 	return uniqueNonEmptyStrings([refreshToken, auth.accessToken, credentialAccessToken]);
 }
 
-async function fetchWithTimeout(
-	url: string,
-	options: RequestInit,
-	timeoutMs: number = REQUEST_TIMEOUT_MS,
-): Promise<Response> {
-	const controller = new AbortController();
-	const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-
-	try {
-		return await fetch(url, {
-			...options,
-			signal: controller.signal,
-		});
-	} catch (error: unknown) {
-		if (error instanceof Error && error.name === "AbortError") {
-			throw new Error(`GitHub Copilot usage request timed out after ${timeoutMs}ms`);
-		}
-		throw error;
-	} finally {
-		clearTimeout(timeoutId);
-	}
-}
-
 async function exchangeForCopilotToken(oauthToken: string): Promise<string | null> {
-	const response = await fetchWithTimeout(COPILOT_TOKEN_EXCHANGE_URL, {
-		headers: {
-			Accept: "application/json",
-			Authorization: `Bearer ${oauthToken}`,
-			...COPILOT_HEADERS,
+	const response = await fetchWithTimeout(
+		COPILOT_TOKEN_EXCHANGE_URL,
+		{
+			headers: {
+				Accept: "application/json",
+				Authorization: `Bearer ${oauthToken}`,
+				...COPILOT_HEADERS,
+			},
 		},
-	});
+		{
+			timeoutMs: REQUEST_TIMEOUT_MS,
+			timeoutMessage: `GitHub Copilot usage request timed out after ${REQUEST_TIMEOUT_MS}ms`,
+		},
+	);
 
 	if (!response.ok) {
 		return null;
@@ -313,13 +297,20 @@ async function exchangeForCopilotToken(oauthToken: string): Promise<string | nul
 }
 
 async function fetchInternalUser(authorization: string): Promise<Response> {
-	return fetchWithTimeout(COPILOT_INTERNAL_USER_URL, {
-		headers: {
-			Accept: "application/json",
-			Authorization: authorization,
-			...COPILOT_HEADERS,
+	return fetchWithTimeout(
+		COPILOT_INTERNAL_USER_URL,
+		{
+			headers: {
+				Accept: "application/json",
+				Authorization: authorization,
+				...COPILOT_HEADERS,
+			},
 		},
-	});
+		{
+			timeoutMs: REQUEST_TIMEOUT_MS,
+			timeoutMessage: `GitHub Copilot usage request timed out after ${REQUEST_TIMEOUT_MS}ms`,
+		},
+	);
 }
 
 /**

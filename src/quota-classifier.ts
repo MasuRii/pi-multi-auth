@@ -1,3 +1,4 @@
+import { parseRetryAfterCooldownMs } from "./balancer/credential-backoff.js";
 import type { RateLimitWindow } from "./usage/types.js";
 import {
 	QUOTA_COOLDOWN_MS,
@@ -213,14 +214,40 @@ export class QuotaClassifier {
 			}
 		}
 
-		for (const classification of [
-			"balance",
-			"organization",
-			"monthly",
-			"weekly",
-			"daily",
-			"hourly",
-		] as const) {
+		for (const classification of ["balance", "organization"] as const) {
+			if (matchesAny(normalizedMessage, MESSAGE_PATTERNS[classification])) {
+				return {
+					classification,
+					cooldownMs: cooldownFor(classification),
+					recoveryAction: recoveryActionFor(classification),
+					confidence: "high",
+					source: "message",
+				};
+			}
+		}
+
+		const retryAfterCooldownMs = parseRetryAfterCooldownMs(normalizedMessage);
+		if (retryAfterCooldownMs !== undefined) {
+			const now = Date.now();
+			const retryAfterClassification = classifyDuration(retryAfterCooldownMs);
+			const classification: QuotaClassification = retryAfterClassification === "unknown"
+				? "unknown"
+				: retryAfterClassification;
+			const window = buildQuotaWindow(classification, now + retryAfterCooldownMs, now);
+			return {
+				classification,
+				window,
+				cooldownMs: retryAfterCooldownMs,
+				recoveryAction: recoveryActionWithEstimatedWait(
+					classification,
+					retryAfterCooldownMs,
+				),
+				confidence: "high",
+				source: "message",
+			};
+		}
+
+		for (const classification of ["monthly", "weekly", "daily", "hourly"] as const) {
 			if (matchesAny(normalizedMessage, MESSAGE_PATTERNS[classification])) {
 				const now = Date.now();
 				const window = inferMessageQuotaWindow(classification, normalizedMessage, now);

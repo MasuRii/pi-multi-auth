@@ -22,6 +22,11 @@ import type {
 } from "./types.js";
 import { selectBestCredential } from "./weighted-selector.js";
 import type { ProviderCapabilities } from "../provider-registry.js";
+import {
+	createAbortError,
+	isRecord,
+	throwFixedAbortErrorIfAborted,
+} from "../auth-error-utils.js";
 
 const DEFAULT_CONFIG = {
 	waitTimeoutMs: 30_000,
@@ -178,7 +183,10 @@ export class KeyDistributor {
 
 		try {
 			const resolvedLease = await this.withProviderAcquireLock(request.providerId, async () => {
-				assertNotAborted(request.signal, request.providerId);
+				throwFixedAbortErrorIfAborted(
+					request.signal,
+					createCredentialAvailabilityAbortMessage(request.providerId),
+				);
 				const existingLease = this.getActiveLeaseForSession(normalizedSessionId);
 				if (existingLease && existingLease.providerId === request.providerId) {
 					if (!(options.excludedIds ?? []).includes(existingLease.credentialId)) {
@@ -213,7 +221,10 @@ export class KeyDistributor {
 					},
 					request.signal,
 				);
-				assertNotAborted(request.signal, request.providerId);
+				throwFixedAbortErrorIfAborted(
+					request.signal,
+					createCredentialAvailabilityAbortMessage(request.providerId),
+				);
 				const acquiredAt = Date.now();
 				const lease: InternalLease = {
 					sessionId: effectiveLeaseSessionId,
@@ -238,7 +249,7 @@ export class KeyDistributor {
 			this.recordAcquireSuccess(request.providerId, Date.now() - startedAt);
 			return resolvedLease;
 		} catch (error) {
-			if (isAbortError(error)) {
+			if (isNamedAbortError(error)) {
 				this.unregisterLease(effectiveLeaseSessionId);
 			}
 			this.recordAcquireFailure(request.providerId, Date.now() - startedAt, error, request.signal);
@@ -250,11 +261,17 @@ export class KeyDistributor {
 		providerId: SupportedProviderId,
 		options: { modelId?: string; modelRef?: string; api?: string; signal?: AbortSignal } = {},
 	): Promise<boolean> {
-		assertNotAborted(options.signal, providerId);
+		throwFixedAbortErrorIfAborted(
+			options.signal,
+			createCredentialAvailabilityAbortMessage(providerId),
+		);
 		await this.clearExpiredCooldowns();
 		const now = Date.now();
 		const snapshot = await this.buildSnapshot(providerId, now);
-		assertNotAborted(options.signal, providerId);
+		throwFixedAbortErrorIfAborted(
+			options.signal,
+			createCredentialAvailabilityAbortMessage(providerId),
+		);
 		if (snapshot.credentialIds.length === 0) {
 			return false;
 		}
@@ -269,7 +286,10 @@ export class KeyDistributor {
 			snapshot.credentialIds,
 			options.signal,
 		);
-		assertNotAborted(options.signal, providerId);
+		throwFixedAbortErrorIfAborted(
+			options.signal,
+			createCredentialAvailabilityAbortMessage(providerId),
+		);
 		const eligibleCredentialIds = await this.getStructurallyEligibleCredentialIds(
 			providerId,
 			effectiveContext,
@@ -685,11 +705,17 @@ export class KeyDistributor {
 		request: DelegatedCredentialRequest,
 	): Promise<DelegatedRoutingCapabilities> {
 		const normalizedRequest = normalizeDelegatedCredentialRequest(request, undefined, {});
-		assertNotAborted(normalizedRequest.signal, normalizedRequest.providerId);
+		throwFixedAbortErrorIfAborted(
+			normalizedRequest.signal,
+			createCredentialAvailabilityAbortMessage(normalizedRequest.providerId),
+		);
 		await this.clearExpiredCooldowns();
 		const now = Date.now();
 		const snapshot = await this.buildSnapshot(normalizedRequest.providerId, now);
-		assertNotAborted(normalizedRequest.signal, normalizedRequest.providerId);
+		throwFixedAbortErrorIfAborted(
+			normalizedRequest.signal,
+			createCredentialAvailabilityAbortMessage(normalizedRequest.providerId),
+		);
 		const selectionContext: SelectionContext = {
 			providerId: normalizedRequest.providerId,
 			excludedIds: [],
@@ -829,9 +855,15 @@ export class KeyDistributor {
 			return new Set<string>();
 		}
 
-		assertNotAborted(signal, providerId);
+		throwFixedAbortErrorIfAborted(
+			signal,
+			createCredentialAvailabilityAbortMessage(providerId),
+		);
 		const credentialSnapshot = await this.authWriter.getCredentials(credentialIds);
-		assertNotAborted(signal, providerId);
+		throwFixedAbortErrorIfAborted(
+			signal,
+			createCredentialAvailabilityAbortMessage(providerId),
+		);
 		const expiredCredentialIds = new Set<string>();
 		const expirationCheckTimestamp = Date.now();
 		for (const credentialId of credentialIds) {
@@ -987,12 +1019,18 @@ export class KeyDistributor {
 		context: SelectionContext,
 		signal?: AbortSignal,
 	): Promise<string> {
-		assertNotAborted(signal, context.providerId);
+		throwFixedAbortErrorIfAborted(
+			signal,
+			createCredentialAvailabilityAbortMessage(context.providerId),
+		);
 		await this.clearExpiredCooldowns();
 		const waitDeadline = Date.now() + this.config.waitTimeoutMs;
 
 		while (true) {
-			assertNotAborted(signal, context.providerId);
+			throwFixedAbortErrorIfAborted(
+				signal,
+				createCredentialAvailabilityAbortMessage(context.providerId),
+			);
 			const now = Date.now();
 			const changedProviders = new Set<SupportedProviderId>();
 			this.clearExpiredLeases(now, changedProviders);
@@ -1003,7 +1041,10 @@ export class KeyDistributor {
 			}
 
 			const snapshot = await this.buildSnapshot(context.providerId, now);
-			assertNotAborted(signal, context.providerId);
+			throwFixedAbortErrorIfAborted(
+				signal,
+				createCredentialAvailabilityAbortMessage(context.providerId),
+			);
 			if (snapshot.credentialIds.length === 0) {
 				throw new Error(
 					`No credentials available for ${context.providerId} in balancer mode. Open /multi-auth and add an account.`,
@@ -1015,7 +1056,10 @@ export class KeyDistributor {
 				snapshot.credentialIds,
 				signal,
 			);
-			assertNotAborted(signal, context.providerId);
+			throwFixedAbortErrorIfAborted(
+				signal,
+				createCredentialAvailabilityAbortMessage(context.providerId),
+			);
 			const selectedCredentialId = await this.selectConfiguredCredentialId(
 				effectiveContext,
 				snapshot,
@@ -1441,7 +1485,7 @@ export class KeyDistributor {
 	): void {
 		const metrics = this.getOrCreateProviderMetrics(providerId);
 		metrics.acquisitionLatencyMs.record(durationMs);
-		if (isAbortError(error)) {
+		if (isNamedAbortError(error)) {
 			metrics.abortedCount += 1;
 			if (signal?.aborted) {
 				metrics.timeoutCount += 1;
@@ -1476,7 +1520,7 @@ export class KeyDistributor {
 		signal?: AbortSignal,
 	): Promise<void> {
 		if (signal?.aborted) {
-			throw createAbortError(providerId);
+			throw createAbortError(createCredentialAvailabilityAbortMessage(providerId));
 		}
 
 		await new Promise<void>((resolve, reject) => {
@@ -1514,7 +1558,9 @@ export class KeyDistributor {
 			};
 
 			const onAbort = (): void => {
-				waiter.reject(createAbortError(providerId));
+				waiter.reject(
+					createAbortError(createCredentialAvailabilityAbortMessage(providerId)),
+				);
 			};
 
 			waiters.add(waiter);
@@ -1682,13 +1728,12 @@ function toNonNegativeNumber(value: number | undefined, fallback: number): numbe
 	return value;
 }
 
-function createAbortError(providerId: SupportedProviderId): Error {
-	const error = new Error(`Wait for credential availability aborted for ${providerId}.`);
-	error.name = "AbortError";
-	return error;
+function createCredentialAvailabilityAbortMessage(providerId: SupportedProviderId): string {
+	return `Wait for credential availability aborted for ${providerId}.`;
 }
 
-function isAbortError(error: unknown): boolean {
+// Keep balancer metrics and lease cleanup limited to explicit AbortError instances.
+function isNamedAbortError(error: unknown): boolean {
 	return error instanceof Error && error.name === "AbortError";
 }
 
@@ -1696,14 +1741,6 @@ function isAcquireTimeoutError(error: unknown): boolean {
 	return error instanceof Error && error.message.startsWith("Timed out after ");
 }
 
-function assertNotAborted(signal: AbortSignal | undefined, providerId: SupportedProviderId): void {
-	if (signal?.aborted) {
-		throw createAbortError(providerId);
-	}
-}
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 export { DEFAULT_CONFIG };

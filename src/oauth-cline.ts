@@ -8,6 +8,12 @@ import {
 	registerOAuthProvider,
 	unregisterOAuthProvider,
 } from "./oauth-compat.js";
+import { fetchWithTimeout } from "./async-utils.js";
+import {
+	isRecord,
+	normalizeNonEmptyString,
+	throwFixedAbortErrorIfAborted,
+} from "./auth-error-utils.js";
 import { buildClineClientHeaders } from "./cline-compat.js";
 import {
 	OAuthRefreshFailureError,
@@ -26,6 +32,7 @@ const CALLBACK_PORT_RANGE_START = 48_801;
 const CALLBACK_PORT_RANGE_END = 48_811;
 const MANUAL_CALLBACK_PROMPT = "Paste the Cline callback URL or authorization code:";
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
+const CLINE_OAUTH_CANCELLED_MESSAGE = "Cline OAuth login was cancelled.";
 
 const AUTH_SUCCESS_HTML = `<!DOCTYPE html>
 <html lang="en">
@@ -92,18 +99,6 @@ export interface ClineOAuthProviderDependencies {
 	startLocalCallbackServer: () => Promise<LocalCallbackServerHandle>;
 	requestTimeoutMs: number;
 	now: () => number;
-}
-
-function normalizeNonEmptyString(value: unknown): string | undefined {
-	if (typeof value !== "string") {
-		return undefined;
-	}
-	const normalized = value.trim();
-	return normalized.length > 0 ? normalized : undefined;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function createRefreshFailureDetails(
@@ -242,27 +237,6 @@ async function readResponsePayload(response: Response): Promise<{
 	};
 }
 
-async function fetchWithTimeout(
-	fetchImplementation: typeof fetch,
-	input: RequestInfo | URL,
-	init: RequestInit,
-	timeoutMs: number,
-): Promise<Response> {
-	const controller = new AbortController();
-	const timeoutId = setTimeout(() => {
-		controller.abort();
-	}, timeoutMs);
-
-	try {
-		return await fetchImplementation(input, {
-			...init,
-			signal: controller.signal,
-		});
-	} finally {
-		clearTimeout(timeoutId);
-	}
-}
-
 async function requestAuthorizeRedirectUrl(
 	fetchImplementation: typeof fetch,
 	callbackUrl: string,
@@ -274,14 +248,13 @@ async function requestAuthorizeRedirectUrl(
 	url.searchParams.set("redirect_uri", callbackUrl);
 
 	const response = await fetchWithTimeout(
-		fetchImplementation,
 		url,
 		{
 			method: "GET",
 			headers: createRequestHeaders(),
 			redirect: "manual",
 		},
-		requestTimeoutMs,
+		{ fetchImplementation, timeoutMs: requestTimeoutMs },
 	);
 
 	if (response.status >= 300 && response.status < 400) {
@@ -319,14 +292,13 @@ async function exchangeAuthorizationCode(
 	}
 
 	const response = await fetchWithTimeout(
-		fetchImplementation,
 		new URL(CLINE_TOKEN_ENDPOINT, CLINE_API_BASE_URL),
 		{
 			method: "POST",
 			headers: createRequestHeaders(),
 			body: JSON.stringify(body),
 		},
-		requestTimeoutMs,
+		{ fetchImplementation, timeoutMs: requestTimeoutMs },
 	);
 
 	const payload = (await response.json().catch(() => null)) as ClineAuthResponse | null;
@@ -358,7 +330,6 @@ async function refreshStoredCredentials(
 	let response: Response;
 	try {
 		response = await fetchWithTimeout(
-			fetchImplementation,
 			new URL(CLINE_REFRESH_ENDPOINT, CLINE_API_BASE_URL),
 			{
 				method: "POST",
@@ -368,7 +339,7 @@ async function refreshStoredCredentials(
 					grantType: "refresh_token",
 				}),
 			},
-			requestTimeoutMs,
+			{ fetchImplementation, timeoutMs: requestTimeoutMs },
 		);
 	} catch (error) {
 		throw new OAuthRefreshFailureError(
@@ -404,18 +375,6 @@ async function refreshStoredCredentials(
 			normalizeNonEmptyString(refreshed.accountId) ??
 			normalizeNonEmptyString(credentials.accountId),
 	};
-}
-
-function createAbortError(): Error {
-	const error = new Error("Cline OAuth login was cancelled.");
-	error.name = "AbortError";
-	return error;
-}
-
-function throwIfAborted(signal: AbortSignal | undefined): void {
-	if (signal?.aborted) {
-		throw createAbortError();
-	}
 }
 
 function fallbackCallbackUrl(): string {
@@ -563,7 +522,7 @@ export function createClineOAuthProvider(
 		name: CLINE_PROVIDER_NAME,
 		usesCallbackServer: true,
 		async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-			throwIfAborted(callbacks.signal);
+			throwFixedAbortErrorIfAborted(callbacks.signal, CLINE_OAUTH_CANCELLED_MESSAGE);
 
 			let callbackServer: LocalCallbackServerHandle | null = null;
 			let callbackUrl = fallbackCallbackUrl();
@@ -586,7 +545,7 @@ export function createClineOAuthProvider(
 					callbackUrl,
 					resolvedDependencies.requestTimeoutMs,
 				);
-				throwIfAborted(callbacks.signal);
+				throwFixedAbortErrorIfAborted(callbacks.signal, CLINE_OAUTH_CANCELLED_MESSAGE);
 				callbacks.onAuth({
 					url: authUrl,
 					instructions:
@@ -595,7 +554,7 @@ export function createClineOAuthProvider(
 
 				callbacks.onProgress?.("Waiting for Cline authentication callback...");
 				const rawInput = await resolveAuthorizationInput(callbacks, callbackServer);
-				throwIfAborted(callbacks.signal);
+				throwFixedAbortErrorIfAborted(callbacks.signal, CLINE_OAUTH_CANCELLED_MESSAGE);
 				const parsedInput = parseAuthorizationInput(rawInput);
 				const code = normalizeNonEmptyString(parsedInput.code);
 				if (!code) {

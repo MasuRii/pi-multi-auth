@@ -142,17 +142,22 @@ function extractJsonErrorFields(parsed: unknown): { code?: string; message?: str
 	}
 
 	const nestedError = isRecord(parsed.error) ? parsed.error : undefined;
+	const firstCloudflareError = Array.isArray(parsed.errors)
+		? parsed.errors.find(isRecord)
+		: undefined;
 	const code =
 		stringifyJsonField(parsed.code) ??
 		stringifyJsonField(parsed.error_code) ??
 		stringifyJsonField(nestedError?.code) ??
-		stringifyJsonField(nestedError?.type);
+		stringifyJsonField(nestedError?.type) ??
+		stringifyJsonField(firstCloudflareError?.code);
 	const message =
 		stringifyJsonField(parsed.message) ??
 		stringifyJsonField(parsed.detail) ??
 		stringifyJsonField(parsed.msg) ??
 		stringifyJsonField(parsed.error) ??
-		stringifyJsonField(nestedError?.message);
+		stringifyJsonField(nestedError?.message) ??
+		stringifyJsonField(firstCloudflareError?.message);
 
 	return { code, message };
 }

@@ -58,7 +58,7 @@ export const DEFAULT_HISTORY_PERSISTENCE_CONFIG: HistoryPersistenceConfig = {
 };
 
 export const DEFAULT_CODEX_MODEL_ENTITLEMENT_CONFIG: CodexModelEntitlementConfig = {
-	usageLookupFailureMode: "strict",
+	usageLookupFailureMode: "allow-unverified",
 };
 
 export const DEFAULT_MODEL_ENTITLEMENT_CONFIG: ModelEntitlementConfig = {

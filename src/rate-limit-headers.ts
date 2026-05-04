@@ -1,13 +1,5 @@
 import type { ParsedRateLimitHeaders, ProviderRateLimitConfig } from "./types-quota.js";
 
-const GOOGLE_CONFIG: ProviderRateLimitConfig = {
-	limitHeaders: ["x-ratelimit-limit"],
-	remainingHeaders: ["x-ratelimit-remaining"],
-	resetHeaders: [],
-	resetFormat: "epoch",
-	parseRetryAfter: true,
-};
-
 const PROVIDER_CONFIGS: Record<string, ProviderRateLimitConfig> = {
 	"openai-codex": {
 		limitHeaders: ["x-ratelimit-limit-requests", "x-ratelimit-limit"],
@@ -30,8 +22,6 @@ const PROVIDER_CONFIGS: Record<string, ProviderRateLimitConfig> = {
 		resetFormat: "rfc3339",
 		parseRetryAfter: true,
 	},
-	"google-gemini-cli": GOOGLE_CONFIG,
-	"google-antigravity": GOOGLE_CONFIG,
 };
 
 const DEFAULT_CONFIG: ProviderRateLimitConfig = {

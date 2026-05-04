@@ -46,6 +46,13 @@ const CONTEXT_LIMIT_PATTERNS: RegExp[] = [
 	/num_ctx/i,
 ];
 
+const AUTH_TOKEN_INVALIDATED_PATTERNS: RegExp[] = [
+	/(?:auth(?:entication)?|access|oauth)\s+token[^\n.]*invalidated/i,
+	/invalidated[^\n.]*\b(?:auth(?:entication)?|access|oauth)\s+token\b/i,
+	/(?:^|[^\p{L}\p{N}])token[_-]?(?:revoked|invalidated)(?:$|[^\p{L}\p{N}])/iu,
+	/try\s+signing\s+in\s+again/i,
+];
+
 const AUTH_PATTERNS: RegExp[] = [
 	/invalid[_-]?api[_-]?key/i,
 	/incorrect\s+api\s+key/i,
@@ -207,6 +214,14 @@ const MODEL_NOT_SUPPORTED_PATTERNS: RegExp[] = [
 	/unknown model/i,
 ];
 
+const CODEX_CREDENTIAL_MODEL_ACCESS_PATTERNS: RegExp[] = [
+	/model[^\n]*(?:not found|not supported|not available|not enabled)/i,
+	/not supported when using codex with a chatgpt account/i,
+	/(?:do not|don't|does not|doesn't) have access[^\n]*(?:model|gpt)/i,
+	/(?:account|plan|subscription)[^\n]*(?:cannot|can't|does not|doesn't|not allowed|not permitted)[^\n]*(?:access|use)/i,
+	/requires[^\n]*(?:plus|pro|team|business|enterprise|paid)/i,
+];
+
 function matchesAny(message: string, patterns: readonly RegExp[]): boolean {
 	return patterns.some((pattern) => pattern.test(message));
 }
@@ -235,6 +250,22 @@ function withQuotaClassification(
 	};
 }
 
+export function isCredentialModelIncompatibilityError(
+	errorText: string,
+	context?: CredentialErrorContext,
+): boolean {
+	const message = errorText.trim();
+	const providerId = (context?.providerId ?? "").trim().toLowerCase();
+	const rawModelId = (context?.modelId ?? "").trim().toLowerCase();
+	const separatorIndex = rawModelId.indexOf("/");
+	const modelId = separatorIndex >= 0 ? rawModelId.slice(separatorIndex + 1).trim() : rawModelId;
+	if (!message || providerId !== "openai-codex" || !modelId.startsWith("gpt-")) {
+		return false;
+	}
+
+	return matchesAny(message, CODEX_CREDENTIAL_MODEL_ACCESS_PATTERNS);
+}
+
 export function isRetryableModelAvailabilityError(
 	errorText: string,
 	context?: CredentialErrorContext,
@@ -242,6 +273,10 @@ export function isRetryableModelAvailabilityError(
 	const message = errorText.trim();
 	if (!message) {
 		return false;
+	}
+
+	if (isCredentialModelIncompatibilityError(message, context)) {
+		return true;
 	}
 
 	if ((context?.providerId ?? "").trim().toLowerCase() !== "vivgrid") {
@@ -275,6 +310,17 @@ export function classifyCredentialError(
 			shouldApplyCooldown: false,
 			shouldDisableCredential: false,
 			reason: "Context/token limit error detected",
+		};
+	}
+
+	if (matchesAny(message, AUTH_TOKEN_INVALIDATED_PATTERNS)) {
+		return {
+			kind: "authentication",
+			shouldRotateCredential: true,
+			shouldRetrySameCredential: false,
+			shouldApplyCooldown: false,
+			shouldDisableCredential: true,
+			reason: "Authentication token invalidated - credential disabled until re-authenticated",
 		};
 	}
 

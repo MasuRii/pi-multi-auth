@@ -240,10 +240,17 @@ export class UsageService {
 	}
 
 	/**
-	 * Clears cache for one credential.
+	 * Clears operational cache for one credential while preserving last-known display data.
+	 */
+	clearOperationalCredential(providerId: string, credentialId: string): void {
+		this.clearIndexedCache(providerId, credentialId, this.cache, this.cacheKeysByCredential, true);
+	}
+
+	/**
+	 * Clears all cache for one credential.
 	 */
 	clearCredential(providerId: string, credentialId: string): void {
-		this.clearIndexedCache(providerId, credentialId, this.cache, this.cacheKeysByCredential, true);
+		this.clearOperationalCredential(providerId, credentialId);
 		this.clearIndexedCache(providerId, credentialId, this.displayCache, this.displayCacheKeysByCredential);
 		this.preferredCredentialCacheKeys.delete(providerCredentialIndexKey(providerId, credentialId));
 	}
@@ -438,7 +445,7 @@ export class UsageService {
 		}
 
 		const entry = this.displayCache.get(preferredKey);
-		if (!entry || entry.displayUntil <= now || !entry.result.snapshot) {
+		if (!entry || !entry.result.snapshot) {
 			return null;
 		}
 
@@ -486,7 +493,10 @@ export class UsageService {
 		credentialId: string,
 		now: number,
 	): UsageFetchResult | null {
-		const preferredRead = this.resolvePreferredDisplayRead(providerId, credentialId, now);
+		const preferredKey = this.preferredCredentialCacheKeys.get(
+			providerCredentialIndexKey(providerId, credentialId),
+		);
+		const preferredRead = preferredKey ? this.resolvePreferredDisplayRead(providerId, credentialId, now) : null;
 		if (preferredRead) {
 			return preferredRead;
 		}
@@ -496,24 +506,33 @@ export class UsageService {
 			return null;
 		}
 
-		let selected: UsageFetchResult | null = null;
+		let selected: UsageDisplayCacheEntry | null = null;
 		let selectedKey: string | null = null;
 		for (const key of keys) {
 			const entry = this.displayCache.get(key);
-			if (!entry || entry.displayUntil <= now || !entry.result.snapshot) {
+			if (!entry || !entry.result.snapshot) {
+				continue;
+			}
+			if (preferredKey) {
+				if (!selected || entry.result.fetchedAt > selected.result.fetchedAt) {
+					selected = entry;
+					selectedKey = key;
+				}
 				continue;
 			}
 			if (selected && selectedKey !== key) {
 				return null;
 			}
-			selected = {
-				...entry.result,
-				fromCache: true,
-			};
+			selected = entry;
 			selectedKey = key;
 		}
 
-		return selected;
+		return selected
+			? {
+				...selected.result,
+				fromCache: true,
+			}
+			: null;
 	}
 
 	private resolveCachedRead(

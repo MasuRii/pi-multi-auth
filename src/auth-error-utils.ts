@@ -25,6 +25,15 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+export function normalizeNonEmptyString(value: unknown): string | undefined {
+	if (typeof value !== "string") {
+		return undefined;
+	}
+
+	const normalized = value.trim();
+	return normalized.length > 0 ? normalized : undefined;
+}
+
 export function getErrorMessage(
 	error: unknown,
 	options: GetErrorMessageOptions = {},
@@ -81,6 +90,15 @@ export function toAbortError(signal: AbortSignal | undefined, fallbackMessage: s
 export function throwIfAborted(signal: AbortSignal | undefined, fallbackMessage: string): void {
 	if (signal?.aborted) {
 		throw toAbortError(signal, fallbackMessage);
+	}
+}
+
+export function throwFixedAbortErrorIfAborted(
+	signal: AbortSignal | undefined,
+	message: string,
+): void {
+	if (signal?.aborted) {
+		throw createAbortError(message);
 	}
 }
 

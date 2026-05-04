@@ -1,4 +1,5 @@
 import { constants as fsConstants } from "node:fs";
+import { sleep } from "./async-utils.js";
 import { access, chmod, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import {
@@ -57,16 +58,6 @@ type LockOptions = {
 	stale: number;
 	onCompromised?: (error: Error) => void;
 };
-
-function sleep(ms: number): Promise<void> {
-	if (ms <= 0) {
-		return Promise.resolve();
-	}
-
-	return new Promise((resolve) => {
-		setTimeout(resolve, ms);
-	});
-}
 
 function lockDirPath(filePath: string): string {
 	return `${filePath}.lock`;
@@ -356,20 +347,25 @@ function escapeRegex(value: string): string {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function getNextBackupSuffix(provider: SupportedProviderId, data: RawAuthFileData): number {
+function getFirstAvailableBackupSuffix(provider: SupportedProviderId, data: RawAuthFileData): number {
 	const expression = new RegExp(`^${escapeRegex(provider)}-(\\d+)$`);
-	let maxSuffix = 0;
+	const usedSuffixes = new Set<number>();
 	for (const key of Object.keys(data)) {
 		const match = expression.exec(key);
 		if (!match) {
 			continue;
 		}
 		const suffix = Number.parseInt(match[1], 10);
-		if (Number.isInteger(suffix) && suffix > maxSuffix) {
-			maxSuffix = suffix;
+		if (Number.isInteger(suffix) && suffix > 0) {
+			usedSuffixes.add(suffix);
 		}
 	}
-	return maxSuffix + 1;
+
+	let suffix = 1;
+	while (usedSuffixes.has(suffix)) {
+		suffix += 1;
+	}
+	return suffix;
 }
 
 function cloneStoredCredential(credential: StoredAuthCredential): StoredAuthCredential {
@@ -963,7 +959,7 @@ export class AuthWriter {
 			};
 		}
 
-		const nextSuffix = getNextBackupSuffix(provider, data);
+		const nextSuffix = getFirstAvailableBackupSuffix(provider, data);
 		return {
 			credentialId: `${provider}-${nextSuffix}`,
 			isBackup: true,

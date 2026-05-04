@@ -8,6 +8,7 @@ import test, { type TestContext } from "node:test";
 
 import {
 	createAssistantMessageEventStream,
+	type Api,
 	type AssistantMessage,
 	type AssistantMessageEvent,
 	type Context,
@@ -51,6 +52,52 @@ import { selectBestCredential } from "../src/balancer/weighted-selector.js";
 import { UsageService } from "../src/usage/index.js";
 import type { StoredAuthCredential } from "../src/types.js";
 import type { UsageAuth, UsageSnapshot } from "../src/usage/types.js";
+
+const PI_AGENT_ROUTER_ENV_KEYS = [
+	PI_AGENT_ROUTER_SUBAGENT_ENV,
+	PI_AGENT_ROUTER_DELEGATED_PROVIDER_ID_ENV,
+	PI_AGENT_ROUTER_DELEGATED_CREDENTIAL_ID_ENV,
+	PI_AGENT_ROUTER_DELEGATED_API_KEY_ENV,
+] as const;
+
+type PiAgentRouterEnvKey = (typeof PI_AGENT_ROUTER_ENV_KEYS)[number];
+
+function capturePiAgentRouterEnv(): Record<PiAgentRouterEnvKey, string | undefined> {
+	return Object.fromEntries(
+		PI_AGENT_ROUTER_ENV_KEYS.map((key) => [key, process.env[key]]),
+	) as Record<PiAgentRouterEnvKey, string | undefined>;
+}
+
+function restorePiAgentRouterEnv(env: Record<PiAgentRouterEnvKey, string | undefined>): void {
+	for (const key of PI_AGENT_ROUTER_ENV_KEYS) {
+		const value = env[key];
+		if (typeof value === "string") {
+			process.env[key] = value;
+		} else {
+			delete process.env[key];
+		}
+	}
+}
+
+function clearPiAgentRouterEnv(): void {
+	for (const key of PI_AGENT_ROUTER_ENV_KEYS) {
+		delete process.env[key];
+	}
+}
+
+const piAgentRouterEnvStack: Array<Record<PiAgentRouterEnvKey, string | undefined>> = [];
+
+test.beforeEach(() => {
+	piAgentRouterEnvStack.push(capturePiAgentRouterEnv());
+	clearPiAgentRouterEnv();
+});
+
+test.afterEach(() => {
+	const originalEnv = piAgentRouterEnvStack.pop();
+	if (originalEnv) {
+		restorePiAgentRouterEnv(originalEnv);
+	}
+});
 
 function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => {
@@ -275,7 +322,7 @@ function createAssistantUsage(): AssistantMessage["usage"] {
 }
 
 function createAssistantMessageForTest(
-	model: Model<"openai-completions">,
+	model: Model<Api>,
 	content: AssistantMessage["content"],
 	overrides: Partial<AssistantMessage> = {},
 ): AssistantMessage {
@@ -549,6 +596,58 @@ function createAbortAwareTimeoutProvider(
 	};
 }
 
+test("rotating stream wrapper redacts request auth debug secrets", async (t) => {
+	const provider = "openai-codex";
+	const model = createTestModel(provider);
+	const secret = "sensitive-oauth-token-prefix-1234567890";
+	const capturedLogs: Array<{ event: string; payload: Record<string, unknown> }> = [];
+	const originalLog = multiAuthDebugLogger.log.bind(multiAuthDebugLogger);
+	multiAuthDebugLogger.log = (event: string, payload: Record<string, unknown> = {}) => {
+		capturedLogs.push({ event, payload });
+	};
+	t.after(() => {
+		multiAuthDebugLogger.log = originalLog;
+	});
+
+	const wrapper = createRotatingStreamWrapper(
+		provider,
+		{
+			listProviderCredentialIds: async () => [`${provider}-credential`],
+			acquireCredential: async () => ({
+				provider,
+				credentialId: `${provider}-credential`,
+				credential: {
+					type: "oauth",
+					access: secret,
+					refresh: "refresh-token",
+					expires: Date.now() + 60_000,
+				},
+				secret,
+				index: 0,
+			}),
+			recordCredentialSuccess: async () => undefined,
+			resolveFailoverTarget: async () => null,
+			disableApiKeyCredential: async () => undefined,
+			markTransientProviderError: async () => 0,
+			markQuotaExceeded: async () => undefined,
+		} as unknown as AccountManager,
+		createStreamingBaseProvider(model, {
+			thinking: "No secret should be logged.",
+			text: "Validated output.",
+		}) as never,
+	);
+
+	await collectAssistantEvents(wrapper(model, createTestContext(), { apiKey: "caller-key" }));
+
+	const authLog = capturedLogs.find((entry) => entry.event === "stream_request_auth");
+	assert.ok(authLog);
+	assert.equal(Object.hasOwn(authLog.payload, "secretPrefix"), false);
+	assert.equal(Object.hasOwn(authLog.payload, "secretStartsWithWorkos"), false);
+	assert.equal(authLog.payload.secretKind, "oauth");
+	assert.equal(authLog.payload.hasSecret, true);
+	assert.equal(JSON.stringify(authLog.payload).includes(secret.slice(0, 12)), false);
+});
+
 test("rotating stream wrapper suppresses malformed ollama thinking blocks", async () => {
 	const model = createTestModel("ollama");
 	const malformedThinking =
@@ -712,26 +811,318 @@ test("Cline stream wrapper attaches Cline client headers to model requests", asy
 	assert.ok(observedHeaders["X-TASK-ID"] && observedHeaders["X-TASK-ID"].length > 0);
 });
 
+
+test("Kilo stream wrapper attaches Kilo editor headers to model requests", async () => {
+	const model = createTestModel("kilo");
+	const observedHeaders: Record<string, string | undefined> = {};
+	const wrapper = createRotatingStreamWrapper(
+		"kilo",
+		{
+			acquireCredential: async () => ({
+				provider: "kilo",
+				credentialId: "kilo",
+				credential: { type: "oauth", access: "kilo-token", refresh: "kilo-token", expires: Date.now() + 3_600_000 },
+				secret: "kilo-token",
+				index: 0,
+			}),
+			recordCredentialSuccess: async () => undefined,
+			resolveFailoverTarget: async () => null,
+			disableApiKeyCredential: async () => undefined,
+			markTransientProviderError: async () => 0,
+			markQuotaExceeded: async () => undefined,
+		} as unknown as AccountManager,
+		{
+			streamSimple: (
+				_model: Model<"openai-completions">,
+				_context: Context,
+				options?: SimpleStreamOptions,
+			) => {
+				const headers = options?.headers as Record<string, string> | undefined;
+				observedHeaders["X-KILOCODE-EDITORNAME"] = headers?.["X-KILOCODE-EDITORNAME"];
+				observedHeaders["X-EXISTING"] = headers?.["X-EXISTING"];
+				return createStreamingBaseProvider(model, { thinking: "headers", text: "ok" }).streamSimple();
+			},
+		} as never,
+	);
+
+	const events = await collectAssistantEvents(
+		wrapper(model, createTestContext(), { apiKey: "stale", headers: { "X-EXISTING": "kept" } }),
+	);
+
+	assert.equal(events.some((event) => event.type === "done"), true);
+	assert.equal(observedHeaders["X-KILOCODE-EDITORNAME"], "Pi");
+	assert.equal(observedHeaders["X-EXISTING"], "kept");
+});
+
+test("OpenAI Codex invalidated authentication tokens are disabled while rotating through the full eligible pool", async () => {
+	const model: Model<"openai-codex-responses"> = {
+		id: "gpt-5.5",
+		name: "GPT 5.5",
+		api: "openai-codex-responses",
+		provider: "openai-codex",
+		baseUrl: "https://chatgpt.com/backend-api",
+		reasoning: true,
+		input: ["text"],
+		contextWindow: 128_000,
+		maxTokens: 16_000,
+		cost: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+		},
+	};
+	const workingToken = "paid-codex-token";
+	const credentialIds = Array.from({ length: 12 }, (_, index) =>
+		index === 11 ? "codex-paid" : `codex-invalidated-${index + 1}`,
+	);
+	const tokenByCredentialId = new Map<string, string>(
+		credentialIds.map((credentialId) => [
+			credentialId,
+			credentialId === "codex-paid"
+				? workingToken
+				: `invalidated-codex-token-${credentialId}`,
+		]),
+	);
+	const expectedApiKeys = credentialIds.map((credentialId) => {
+		const token = tokenByCredentialId.get(credentialId);
+		assert.ok(token);
+		return token;
+	});
+	const acquiredCredentialIds: string[] = [];
+	const disabledCredentialIds: string[] = [];
+	const disabledErrorKinds: string[] = [];
+	const quotaCredentialIds: string[] = [];
+	const requestedModelIds: Array<string | undefined> = [];
+	const apiKeysSeen: string[] = [];
+
+	const wrapper = createRotatingStreamWrapper(
+		"openai-codex",
+		{
+			listProviderCredentialIds: async () => credentialIds,
+			acquireCredential: async (
+				_provider: string,
+				requestOptions?: { excludedCredentialIds?: Set<string>; modelId?: string },
+			) => {
+				requestedModelIds.push(requestOptions?.modelId);
+				const excludedCredentialIds = requestOptions?.excludedCredentialIds ?? new Set<string>();
+				const credentialId = credentialIds.find(
+					(candidate) => !excludedCredentialIds.has(candidate),
+				);
+				if (!credentialId) {
+					throw new Error("No Codex credential remained available for GPT 5.5.");
+				}
+				const token = tokenByCredentialId.get(credentialId);
+				assert.ok(token);
+				acquiredCredentialIds.push(credentialId);
+				return {
+					provider: "openai-codex",
+					credentialId,
+					credential: {
+						type: "oauth",
+						access: token,
+						refresh: `refresh-${credentialId}`,
+						expires: Date.now() + 3_600_000,
+						provider: "openai-codex",
+					},
+					secret: token,
+					index: credentialIds.indexOf(credentialId),
+				};
+			},
+			recordCredentialSuccess: async () => undefined,
+			resolveFailoverTarget: async () => null,
+			disableApiKeyCredential: async (
+				_provider: string,
+				credentialId: string,
+				_errorMessage: string,
+				errorKind: string,
+			) => {
+				disabledCredentialIds.push(credentialId);
+				disabledErrorKinds.push(errorKind);
+			},
+			markTransientProviderError: async () => 0,
+			markQuotaExceeded: async (_provider: string, credentialId: string) => {
+				quotaCredentialIds.push(credentialId);
+			},
+		} as unknown as AccountManager,
+		{
+			streamSimple: (
+				_model: Model<"openai-codex-responses">,
+				_context: Context,
+				options?: SimpleStreamOptions,
+			) => {
+				const apiKey = typeof options?.apiKey === "string" ? options.apiKey : "";
+				apiKeysSeen.push(apiKey);
+				const stream = createAssistantMessageEventStream();
+				queueMicrotask(() => {
+					if (apiKey !== workingToken) {
+						stream.push({
+							type: "error",
+							reason: "error",
+							error: createAssistantMessageForTest(model, [], {
+								stopReason: "error",
+								errorMessage:
+									"Encountered invalidated oauth token for user, failing request",
+							}),
+						});
+						stream.end();
+						return;
+					}
+
+					stream.push({
+						type: "done",
+						reason: "stop",
+						message: createAssistantMessageForTest(model, [
+							{ type: "text", text: "Codex rotation recovered." },
+						]),
+					});
+					stream.end();
+				});
+				return stream;
+			},
+		} as never,
+	);
+
+	const events = await collectAssistantEvents(wrapper(model, createTestContext(), { apiKey: "[REDACTED]" }));
+
+	assert.deepEqual(acquiredCredentialIds, credentialIds);
+	assert.deepEqual(requestedModelIds, credentialIds.map(() => "gpt-5.5"));
+	assert.deepEqual(apiKeysSeen, expectedApiKeys);
+	assert.deepEqual(disabledCredentialIds, credentialIds.slice(0, -1));
+	assert.deepEqual(disabledErrorKinds, credentialIds.slice(0, -1).map(() => "authentication"));
+	assert.deepEqual(quotaCredentialIds, []);
+	assert.equal(events.some((event) => event.type === "error"), false);
+	const doneEvent = events.find(
+		(event): event is Extract<AssistantMessageEvent, { type: "done" }> => event.type === "done",
+	);
+	assert.ok(doneEvent);
+	assert.deepEqual(doneEvent.message.content, [
+		{ type: "text", text: "Codex rotation recovered." },
+	]);
+});
+
+test("OpenAI Codex model access errors rotate and record model incompatibility", async () => {
+	const model: Model<"openai-completions"> = {
+		...createTestModel("openai-codex"),
+		id: "gpt-5.4",
+		name: "GPT 5.4",
+	};
+	const credentials = [
+		{ credentialId: "codex-free", secret: "free-codex-token" },
+		{ credentialId: "codex-plus", secret: "plus-codex-token" },
+	];
+	const acquiredCredentialIds: string[] = [];
+	const modelIncompatibilities: Array<{ credentialId: string; modelId: string; message: string }> = [];
+
+	const wrapper = createRotatingStreamWrapper(
+		"openai-codex",
+		{
+			acquireCredential: async (
+				_provider: string,
+				requestOptions?: { excludedCredentialIds?: Set<string>; modelId?: string },
+			) => {
+				assert.equal(requestOptions?.modelId, "gpt-5.4");
+				const excludedCredentialIds = requestOptions?.excludedCredentialIds ?? new Set<string>();
+				const selected = credentials.find(
+					(credential) => !excludedCredentialIds.has(credential.credentialId),
+				);
+				if (!selected) {
+					throw new Error("No Codex credential remained available.");
+				}
+				acquiredCredentialIds.push(selected.credentialId);
+				return {
+					provider: "openai-codex",
+					credentialId: selected.credentialId,
+					credential: { type: "api_key", key: selected.secret },
+					secret: selected.secret,
+					index: credentials.indexOf(selected),
+				};
+			},
+			recordCredentialSuccess: async () => undefined,
+			resolveFailoverTarget: async () => null,
+			disableApiKeyCredential: async () => undefined,
+			markCredentialModelIncompatible: async (
+				_provider: string,
+				credentialId: string,
+				modelId: string,
+				message: string,
+			) => {
+				modelIncompatibilities.push({ credentialId, modelId, message });
+				return Date.now() + 60_000;
+			},
+			markTransientProviderError: async () => 0,
+			markQuotaExceeded: async () => undefined,
+		} as unknown as AccountManager,
+		{
+			streamSimple: (
+				_model: Model<"openai-completions">,
+				_context: Context,
+				options?: SimpleStreamOptions,
+			) => {
+				const apiKey = typeof options?.apiKey === "string" ? options.apiKey : "";
+				const stream = createAssistantMessageEventStream();
+				queueMicrotask(() => {
+					if (apiKey === "free-codex-token") {
+						stream.push({
+							type: "error",
+							reason: "error",
+							error: createAssistantMessageForTest(model, [], {
+								stopReason: "error",
+								errorMessage:
+									"The 'gpt-5.4' model is not supported when using Codex with a ChatGPT account.",
+							}),
+						});
+						stream.end();
+						return;
+					}
+
+					stream.push({
+						type: "done",
+						reason: "stop",
+						message: createAssistantMessageForTest(model, [
+							{ type: "text", text: "paid-codex-account-ok" },
+						]),
+					});
+					stream.end();
+				});
+				return stream;
+			},
+		} as never,
+	);
+
+	const events = await collectAssistantEvents(wrapper(model, createTestContext(), { apiKey: "[REDACTED]" }));
+
+	assert.deepEqual(acquiredCredentialIds, ["codex-free", "codex-plus"]);
+	assert.equal(modelIncompatibilities.length, 1);
+	assert.equal(modelIncompatibilities[0].credentialId, "codex-free");
+	assert.equal(modelIncompatibilities[0].modelId, "gpt-5.4");
+	assert.match(modelIncompatibilities[0].message, /not supported/i);
+	assert.equal(events.some((event) => event.type === "error"), false);
+	const doneEvent = events.find(
+		(event): event is Extract<AssistantMessageEvent, { type: "done" }> => event.type === "done",
+	);
+	assert.ok(doneEvent);
+	assert.deepEqual(doneEvent.message.content, [
+		{ type: "text", text: "paid-codex-account-ok" },
+	]);
+});
+
+test("OpenAI Codex token_revoked OAuth errors classify as disabling authentication failures", () => {
+	const classification = classifyCredentialError(
+		"Encountered invalidated oauth token for user, failing request (code: token_revoked, status: 401)",
+		{ providerId: "openai-codex", modelId: "gpt-5.4" },
+	);
+
+	assert.equal(classification.kind, "authentication");
+	assert.equal(classification.shouldRotateCredential, true);
+	assert.equal(classification.shouldDisableCredential, true);
+	assert.equal(classification.shouldApplyCooldown, false);
+});
+
 test("delegated credential overrides pin the delegated credential through account-manager selection", async (t) => {
 	const model = createTestModel("cline");
 	const delegatedCredentialId = "cline";
 	const acquiredCredentialSelections: string[][] = [];
-	const originalEnv = {
-		[PI_AGENT_ROUTER_SUBAGENT_ENV]: process.env[PI_AGENT_ROUTER_SUBAGENT_ENV],
-		[PI_AGENT_ROUTER_DELEGATED_PROVIDER_ID_ENV]: process.env[PI_AGENT_ROUTER_DELEGATED_PROVIDER_ID_ENV],
-		[PI_AGENT_ROUTER_DELEGATED_CREDENTIAL_ID_ENV]: process.env[PI_AGENT_ROUTER_DELEGATED_CREDENTIAL_ID_ENV],
-		[PI_AGENT_ROUTER_DELEGATED_API_KEY_ENV]: process.env[PI_AGENT_ROUTER_DELEGATED_API_KEY_ENV],
-	};
-
-	t.after(() => {
-		for (const [key, value] of Object.entries(originalEnv)) {
-			if (typeof value === "string") {
-				process.env[key] = value;
-			} else {
-				delete process.env[key];
-			}
-		}
-	});
 
 	process.env[PI_AGENT_ROUTER_SUBAGENT_ENV] = "1";
 	process.env[PI_AGENT_ROUTER_DELEGATED_PROVIDER_ID_ENV] = "cline";
@@ -2569,7 +2960,7 @@ test("account manager refreshCredential only updates the selected OAuth credenti
 	);
 });
 
-test("account manager handles permanent Codex refresh failures without console noise", async (t) => {
+test("account manager disables permanently invalid Codex refresh credentials without console noise", async (t) => {
 	const providerId = "openai-codex";
 	const expiredJwt = createJwtWithExp(Math.floor((Date.now() - 60_000) / 1_000));
 	const { accountManager, storagePath } = await createAccountManagerHarness(t, {
@@ -2636,12 +3027,14 @@ test("account manager handles permanent Codex refresh failures without console n
 	const quotaExhaustedUntil = stored.providers[providerId]?.quotaExhaustedUntil?.[providerId];
 	const lastQuotaError = stored.providers[providerId]?.lastQuotaError?.[providerId];
 	const refreshFailureLog = debugEntries.find((entry) => entry.event === "oauth_refresh_failed");
-	const cooldownLog = debugEntries.find(
-		(entry) => entry.event === "oauth_refresh_codex_cooldown",
+	const disabledLog = debugEntries.find(
+		(entry) => entry.event === "oauth_refresh_codex_disabled",
+	);
+	const providerStatus = await accountManager.getProviderStatus(providerId);
+	const statusCredential = providerStatus.credentials.find(
+		(credential) => credential.credentialId === providerId,
 	);
 
-	// OpenAI Codex permanent refresh failures no longer auto-disable.
-	// Instead, they set a long cooldown (24h) so users can manually re-login.
 	assert.equal(consoleErrorCalls, 0);
 	assert.ok(refreshFailureLog);
 	assert.equal(refreshFailureLog?.payload.permanent, true);
@@ -2650,17 +3043,18 @@ test("account manager handles permanent Codex refresh failures without console n
 	assert.equal(refreshFailureLog?.payload.reason, "token_rejected");
 	assert.equal("errorDescription" in (refreshFailureLog?.payload ?? {}), false);
 	assert.equal("responseBody" in (refreshFailureLog?.payload ?? {}), false);
-	assert.ok(cooldownLog);
-	assert.ok(typeof quotaExhaustedUntil === "number");
-	assert.ok(quotaExhaustedUntil > Date.now());
-	assert.match(lastQuotaError ?? "", /invalid_grant/);
-	assert.doesNotMatch(lastQuotaError ?? "", /raw-refresh-token-123|raw-access-token-123|revoked/i);
+	assert.ok(disabledLog);
+	assert.equal(disabledLog?.payload.errorCode, "invalid_grant");
+	assert.equal(quotaExhaustedUntil, undefined);
+	assert.equal(lastQuotaError, undefined);
+	assert.ok(disabledEntry);
+	assert.match(disabledEntry?.error ?? "", /invalid_grant/);
+	assert.doesNotMatch(disabledEntry?.error ?? "", /raw-refresh-token-123|raw-access-token-123|revoked/i);
+	assert.equal(statusCredential?.disabledError, disabledEntry?.error);
 	assert.doesNotMatch(
 		String(refreshFailureLog?.payload.message ?? ""),
 		/raw-refresh-token-123|raw-access-token-123|revoked/i,
 	);
-	// Credential should NOT be disabled for openai-codex
-	assert.equal(disabledEntry, undefined);
 	assert.deepEqual(stored.providers[providerId]?.oauthRefreshScheduled ?? {}, {});
 });
 

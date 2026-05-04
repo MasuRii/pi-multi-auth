@@ -1,4 +1,4 @@
-import { getErrorMessage } from "./auth-error-utils.js";
+import { getErrorMessage, isRecord } from "./auth-error-utils.js";
 import { buildCloudflareWorkersAiBaseUrl } from "./credential-request-overrides.js";
 
 const CLOUDFLARE_ACCOUNTS_URL = "https://api.cloudflare.com/client/v4/accounts";
@@ -19,9 +19,6 @@ interface CloudflareAccountsResponse {
 	errors?: CloudflareApiError[];
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function parseCloudflareAccountsResponse(value: unknown): CloudflareAccountsResponse {
 	if (!isRecord(value)) {
@@ -60,6 +57,40 @@ function formatCloudflareErrors(errors: CloudflareApiError[] | undefined): strin
 		.join("; ");
 }
 
+function resolveCloudflareDiscoveryHint(
+	status: number,
+	errors: CloudflareApiError[] | undefined,
+): string | null {
+	const messages = (errors ?? [])
+		.map((error) => error.message ?? "")
+		.join(" ");
+	const codes = new Set(
+		(errors ?? [])
+			.map((error) => error.code)
+			.filter((code): code is number => typeof code === "number"),
+	);
+
+	if (codes.has(1211) || /verify\s+your\s+email/i.test(messages)) {
+		return "Verify the Cloudflare account email in the dashboard, then create or retry the API token.";
+	}
+	if (status === 401) {
+		return "Check that the pasted value is a Cloudflare API token and not a redacted token preview.";
+	}
+	if (status === 403) {
+		return "Grant account read/list access for automatic discovery, or paste the account ID, dashboard token URL, or full Workers AI base URL alongside the token.";
+	}
+	return null;
+}
+
+function formatCloudflareDiscoveryFailure(
+	status: number,
+	errors: CloudflareApiError[] | undefined,
+): string {
+	const detail = formatCloudflareErrors(errors);
+	const hint = resolveCloudflareDiscoveryHint(status, errors);
+	return hint ? `${detail} ${hint}` : detail;
+}
+
 async function readCloudflareJsonResponse(response: Response): Promise<CloudflareAccountsResponse> {
 	let parsed: unknown;
 	try {
@@ -88,7 +119,7 @@ export async function discoverCloudflareWorkersAiBaseUrl(
 
 	if (!response.ok || payload.success !== true) {
 		throw new Error(
-			`Cloudflare account discovery failed with HTTP ${response.status}: ${formatCloudflareErrors(payload.errors)}`,
+			`Cloudflare account discovery failed with HTTP ${response.status}: ${formatCloudflareDiscoveryFailure(response.status, payload.errors)}`,
 		);
 	}
 
@@ -99,7 +130,7 @@ export async function discoverCloudflareWorkersAiBaseUrl(
 
 	if (accounts.length === 0) {
 		throw new Error(
-			"Cloudflare account discovery did not return any accounts. Add request.baseUrl manually or grant the token account read/list access.",
+			"Cloudflare account discovery did not return any accounts. Paste the account ID, dashboard token URL, or full Workers AI base URL alongside the token, or grant the token account read/list access.",
 		);
 	}
 
@@ -109,7 +140,7 @@ export async function discoverCloudflareWorkersAiBaseUrl(
 			.filter((name): name is string => typeof name === "string" && name.trim().length > 0)
 			.join(", ");
 		throw new Error(
-			`Cloudflare account discovery returned multiple accounts (${names}). Add request.baseUrl manually for this credential so multi-auth uses the intended account.`,
+			`Cloudflare account discovery returned multiple accounts (${names}). Paste the intended account ID, dashboard token URL, or full Workers AI base URL alongside this token so multi-auth uses the intended account.`,
 		);
 	}
 

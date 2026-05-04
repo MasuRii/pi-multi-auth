@@ -2,7 +2,9 @@ import { readFile, stat } from "node:fs/promises";
 import { getModels, getProviders, type Api, type Model } from "@mariozechner/pi-ai";
 import { getOAuthProvider, getOAuthProviders } from "./oauth-compat.js";
 import { registerClineOAuthProvider } from "./oauth-cline.js";
+import { registerKiloOAuthProvider } from "./oauth-kilo.js";
 import { AuthWriter } from "./auth-writer.js";
+import { isRemovedLegacyGoogleProvider } from "./removed-google-providers.js";
 import {
 	resolveProviderRotationClassification,
 	type ProviderRotationProfile,
@@ -14,6 +16,7 @@ import {
 	type ProviderRegistrationMetadata,
 	type SupportedProviderId,
 } from "./types.js";
+import { isRecord } from "./auth-error-utils.js";
 
 interface ModelsProviderEntry {
 	api: Api;
@@ -53,7 +56,9 @@ const API_KEY_LOGIN_PROVIDER_DISPLAY_NAMES: Readonly<Record<string, string>> = {
 	"amazon-bedrock": "Amazon Bedrock",
 	"azure-openai-responses": "Azure OpenAI Responses",
 	cerebras: "Cerebras",
+	cloudflare: "Cloudflare Workers AI",
 	"cloudflare-workers-ai": "Cloudflare Workers AI",
+	"cloudflare-ai-gateway": "Cloudflare AI Gateway",
 	deepseek: "DeepSeek",
 	fireworks: "Fireworks",
 	google: "Google Gemini",
@@ -70,6 +75,7 @@ const API_KEY_LOGIN_PROVIDER_DISPLAY_NAMES: Readonly<Record<string, string>> = {
 	openrouter: "OpenRouter",
 	"vercel-ai-gateway": "Vercel AI Gateway",
 	xai: "xAI",
+	xiaomi: "Xiaomi MiMo",
 	zai: "ZAI",
 };
 
@@ -81,15 +87,26 @@ const EMPTY_MODELS_FILE: ModelsFileData = {
 	providers: {},
 };
 
+const FIRST_CLASS_OAUTH_PROVIDER_REGISTRARS: Record<string, () => void> = {
+	cline: registerClineOAuthProvider,
+	kilo: registerKiloOAuthProvider,
+};
+
+const THINKING_LEVEL_KEYS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+
 function ensureProviderOAuthRegistration(provider: SupportedProviderId): void {
-	if (provider === "cline" && !getOAuthProvider("cline")) {
-		registerClineOAuthProvider();
+	const registerProvider = FIRST_CLASS_OAUTH_PROVIDER_REGISTRARS[provider];
+	if (registerProvider && !getOAuthProvider(provider as Parameters<typeof getOAuthProvider>[0])) {
+		registerProvider();
 	}
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
+function ensureFirstClassOAuthRegistrations(): void {
+	for (const provider of Object.keys(FIRST_CLASS_OAUTH_PROVIDER_REGISTRARS)) {
+		ensureProviderOAuthRegistration(provider);
+	}
 }
+
 
 function toNumberOrDefault(value: unknown, fallback: number): number {
 	if (typeof value === "number" && Number.isFinite(value) && value > 0) {
@@ -103,6 +120,25 @@ function toBooleanOrDefault(value: unknown, fallback: boolean): boolean {
 		return value;
 	}
 	return fallback;
+}
+
+function toThinkingLevelMap(value: unknown): ProviderModelDefinition["thinkingLevelMap"] {
+	if (!isRecord(value)) {
+		return undefined;
+	}
+
+	const normalized: NonNullable<ProviderModelDefinition["thinkingLevelMap"]> = {};
+	let hasEntries = false;
+
+	for (const key of THINKING_LEVEL_KEYS) {
+		const mapped = value[key];
+		if (typeof mapped === "string" || mapped === null) {
+			normalized[key] = mapped;
+			hasEntries = true;
+		}
+	}
+
+	return hasEntries ? normalized : undefined;
 }
 
 function toInputList(value: unknown): ("text" | "image")[] {
@@ -142,6 +178,7 @@ function normalizeModelRecord(model: unknown, providerApi: Api): ProviderModelDe
 
 	const modelId = model.id.trim();
 	const compat = isRecord(model.compat) ? { ...model.compat } : undefined;
+	const baseUrl = typeof model.baseUrl === "string" && model.baseUrl.trim() ? model.baseUrl.trim() : undefined;
 	const headers = isRecord(model.headers)
 		? Object.fromEntries(
 				Object.entries(model.headers)
@@ -149,12 +186,15 @@ function normalizeModelRecord(model: unknown, providerApi: Api): ProviderModelDe
 					.map(([key, value]) => [key, value]),
 			)
 		: undefined;
+	const thinkingLevelMap = toThinkingLevelMap(model.thinkingLevelMap);
 
 	return {
 		id: modelId,
 		name: typeof model.name === "string" && model.name.trim() ? model.name.trim() : modelId,
 		api: typeof model.api === "string" && model.api.trim() ? (model.api.trim() as Api) : providerApi,
+		baseUrl,
 		reasoning: toBooleanOrDefault(model.reasoning, false),
+		thinkingLevelMap,
 		input: toInputList(model.input),
 		cost: toCost(model.cost),
 		contextWindow: toNumberOrDefault(model.contextWindow, 128_000),
@@ -173,7 +213,9 @@ function mapBuiltInModel(model: Model<Api>): ProviderModelDefinition {
 		id: model.id,
 		name: model.name,
 		api: model.api,
+		baseUrl: model.baseUrl,
 		reasoning: model.reasoning,
+		thinkingLevelMap: model.thinkingLevelMap ? { ...model.thinkingLevelMap } : undefined,
 		input: [...model.input],
 		cost: {
 			input: model.cost.input,
@@ -207,7 +249,7 @@ function normalizeModelsFileData(parsed: unknown): ModelsFileData {
 
 	const providers: Record<string, ModelsProviderEntry> = {};
 	for (const [providerId, rawProvider] of Object.entries(parsed.providers)) {
-		if (!isRecord(rawProvider)) {
+		if (isRemovedLegacyGoogleProvider(providerId) || !isRecord(rawProvider)) {
 			continue;
 		}
 
@@ -286,7 +328,7 @@ export class ProviderRegistry {
 		const seenProviders = new Set<string>();
 		const pushUnique = (provider: string): void => {
 			const normalized = provider.trim();
-			if (!normalized || seenProviders.has(normalized)) {
+			if (!normalized || isRemovedLegacyGoogleProvider(normalized) || seenProviders.has(normalized)) {
 				return;
 			}
 			seenProviders.add(normalized);
@@ -307,6 +349,16 @@ export class ProviderRegistry {
 	}
 
 	getProviderCapabilities(provider: SupportedProviderId): ProviderCapabilities {
+		if (isRemovedLegacyGoogleProvider(provider)) {
+			return {
+				provider,
+				supportsApiKey: false,
+				supportsOAuth: false,
+				hasExternalAccountState: false,
+				rotationProfile: "lightweight",
+			};
+		}
+
 		ensureProviderOAuthRegistration(provider);
 		const supportsOAuth = Boolean(
 			getOAuthProvider(provider as Parameters<typeof getOAuthProvider>[0]),
@@ -324,12 +376,12 @@ export class ProviderRegistry {
 	}
 
 	listAvailableOAuthProviders(): AvailableOAuthProvider[] {
-		ensureProviderOAuthRegistration("cline");
+		ensureFirstClassOAuthRegistrations();
 		const seenProviders = new Set<SupportedProviderId>();
 		const providers: AvailableOAuthProvider[] = [];
 		for (const provider of getOAuthProviders()) {
 			const providerId = provider.id.trim();
-			if (!providerId || seenProviders.has(providerId)) {
+			if (!providerId || isRemovedLegacyGoogleProvider(providerId) || seenProviders.has(providerId)) {
 				continue;
 			}
 			seenProviders.add(providerId);
@@ -356,7 +408,7 @@ export class ProviderRegistry {
 		const seenProviders = new Set<SupportedProviderId>();
 		const pushUnique = (provider: string): void => {
 			const providerId = provider.trim();
-			if (!providerId || seenProviders.has(providerId)) {
+			if (!providerId || isRemovedLegacyGoogleProvider(providerId) || seenProviders.has(providerId)) {
 				return;
 			}
 			seenProviders.add(providerId);
@@ -385,6 +437,10 @@ export class ProviderRegistry {
 	 * Returns true when provider has model metadata from built-in registry or models.json.
 	 */
 	async hasModelMetadata(provider: SupportedProviderId): Promise<boolean> {
+		if (isRemovedLegacyGoogleProvider(provider)) {
+			return false;
+		}
+
 		const builtInModels = getModels(provider as Parameters<typeof getModels>[0]);
 		if (builtInModels.length > 0) {
 			return true;
@@ -399,6 +455,10 @@ export class ProviderRegistry {
 	 * such as integrations used by non-chat features.
 	 */
 	async isCredentialOnlyOAuthProvider(provider: SupportedProviderId): Promise<boolean> {
+		if (isRemovedLegacyGoogleProvider(provider)) {
+			return false;
+		}
+
 		const hasMetadata = await this.hasModelMetadata(provider);
 		if (hasMetadata) {
 			return false;
@@ -426,6 +486,10 @@ export class ProviderRegistry {
 	async resolveProviderRegistrationMetadata(
 		provider: SupportedProviderId,
 	): Promise<ProviderRegistrationMetadata | null> {
+		if (isRemovedLegacyGoogleProvider(provider)) {
+			return null;
+		}
+
 		const builtInModels = getModels(provider as Parameters<typeof getModels>[0]);
 		if (builtInModels.length > 0) {
 			const firstModel = builtInModels[0];

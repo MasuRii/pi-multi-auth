@@ -1,7 +1,7 @@
 import { constants as fsConstants } from "node:fs";
 import { access, chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
-import { getErrorMessage } from "../auth-error-utils.js";
+import { getErrorMessage, isRecord } from "../auth-error-utils.js";
 import { multiAuthDebugLogger } from "../debug-logger.js";
 import {
 	isRetryableFileAccessError,
@@ -66,6 +66,7 @@ export interface UsageCacheHydrationRecords {
 
 export interface UsageCacheHydrationOptions {
 	isCredentialValid?: (providerId: string, credentialId: string, credentialCacheKey: string) => boolean;
+	isDisplayCredentialValid?: (providerId: string, credentialId: string, credentialCacheKey: string) => boolean;
 	resolveLegacyCredentialCacheKey?: (providerId: string, credentialId: string) => string | null;
 	pruneInvalidEntries?: boolean;
 }
@@ -109,9 +110,6 @@ function getDefaultUsageCachePath(): string {
 	return resolveAgentRuntimePath("multi-auth-usage-cache.json");
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function isNonEmptyString(value: unknown): value is string {
 	return typeof value === "string" && value.trim().length > 0;
@@ -467,6 +465,26 @@ function isEntryAllowed(
 	}
 }
 
+function isDisplayEntryAllowed(
+	entry: CredentialScopedUsageCacheEntry,
+	options: UsageCacheHydrationOptions,
+): boolean {
+	const validator = options.isDisplayCredentialValid ?? options.isCredentialValid;
+	if (!validator) {
+		return true;
+	}
+	try {
+		return validator(entry.provider, entry.credentialId, entry.credentialCacheKey);
+	} catch (error: unknown) {
+		multiAuthDebugLogger.log("usage_cache_display_credential_validation_error", {
+			provider: entry.provider,
+			credentialId: entry.credentialId,
+			error: getErrorMessage(error),
+		});
+		return false;
+	}
+}
+
 export class UsageSnapshotCacheStore {
 	private readonly filePath: string;
 	private readonly maxEntries: number;
@@ -732,7 +750,7 @@ export class UsageSnapshotCacheStore {
 	): PersistedUsageDisplayCacheEntry[] {
 		const latestByCredential = new Map<string, PersistedUsageDisplayCacheEntry>();
 		for (const entry of entries) {
-			if (entry.displayUntil <= now || !isEntryAllowed(entry, options)) {
+			if (entry.displayUntil <= now || !isDisplayEntryAllowed(entry, options)) {
 				continue;
 			}
 			const key = createRecordKey(entry.provider, entry.credentialId, entry.credentialCacheKey);

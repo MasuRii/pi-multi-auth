@@ -9,11 +9,14 @@ import {
 	pruneBatchSelection,
 	toggleBatchSelection,
 } from "./account-batch-selection.js";
+import { parseCloudflareCredentialBatchInput } from "./cloudflare-credential-input.js";
+import { isCloudflareWorkersAiProvider } from "./cloudflare-provider.js";
 import { runOAuthLoginDialog } from "./oauth-login-flow.js";
 import { runProviderConfigurationDialog } from "./provider-configuration-dialog.js";
 import { getErrorMessage } from "./auth-error-utils.js";
 import { parseApiKeyBatchInput } from "./credential-display.js";
 import { ModalVisibilityController } from "./modal-visibility.js";
+import { isRemovedLegacyGoogleProvider } from "./removed-google-providers.js";
 import { formatResetCountdown } from "./formatters/bar.js";
 import { resolveBorderGlyphs } from "./formatters/charset.js";
 import {
@@ -43,6 +46,7 @@ import {
 } from "./rotation-modes.js";
 import {
 	LEGACY_SUPPORTED_PROVIDERS,
+	type CredentialRequestOverrides,
 	type CredentialStatus,
 	type ProviderStatus,
 	type SupportedProviderId,
@@ -292,6 +296,12 @@ export function normalizeProviderSelectionInput(
 			message: "Provider name cannot contain spaces. Use IDs like 'openrouter' or 'my-provider'.",
 		};
 	}
+	if (isRemovedLegacyGoogleProvider(normalizedInput)) {
+		return {
+			ok: false,
+			message: "Legacy Google providers are no longer supported.",
+		};
+	}
 
 	const canonicalProvider = knownProviderIds.find(
 		(providerId) => providerId.trim().toLowerCase() === normalizedInput.toLowerCase(),
@@ -398,10 +408,6 @@ function formatProviderLabel(provider: SupportedProviderId): string {
 			return "openai-codex";
 		case "github-copilot":
 			return "github-copilot";
-		case "google-gemini-cli":
-			return "google-gemini";
-		case "google-antigravity":
-			return "google-antigrav";
 		default:
 			return provider;
 	}
@@ -572,14 +578,10 @@ function formatWindowDurationLabel(windowMinutes: number | null): string | null 
 	return `${windowMinutes}-minute window`;
 }
 
-function resolveUsageWindowLabel(
+export function resolveUsageWindowLabel(
 	snapshot: UsageSnapshot,
 	slot: "primary" | "secondary",
 ): string {
-	if (snapshot.provider === "openai-codex" || snapshot.provider === "anthropic") {
-		return slot === "primary" ? "5-hour window" : "7-day window (weekly)";
-	}
-
 	const window = slot === "primary" ? snapshot.primary : snapshot.secondary;
 	const durationLabel = formatWindowDurationLabel(window?.windowMinutes ?? null);
 	if (!durationLabel) {
@@ -607,18 +609,71 @@ async function loginProviderFromModal(
 	return runOAuthLoginDialog(ctx, accountManager, provider);
 }
 
+interface ParsedProviderApiKeyInputEntry {
+	apiKey: string;
+	request?: CredentialRequestOverrides;
+}
+
+interface ParsedProviderApiKeyInput {
+	entries: ParsedProviderApiKeyInputEntry[];
+	duplicateCount: number;
+	ignoredLineCount: number;
+	requestOverrideCount?: number;
+}
+
+function parseProviderApiKeyInput(
+	provider: SupportedProviderId,
+	apiKeyInput: string,
+	allowBatch: boolean,
+): { ok: true; parsed: ParsedProviderApiKeyInput } | { ok: false; message: string } {
+	if (isCloudflareWorkersAiProvider(provider)) {
+		const parsed = parseCloudflareCredentialBatchInput(apiKeyInput, {
+			allowMultiple: allowBatch,
+		});
+		if (!parsed.ok) {
+			return parsed;
+		}
+		return {
+			ok: true,
+			parsed: {
+				entries: parsed.entries.map((entry) => ({
+					apiKey: entry.apiToken,
+					...(entry.request && { request: entry.request }),
+				})),
+				duplicateCount: parsed.duplicateCount,
+				ignoredLineCount: parsed.ignoredLineCount,
+				requestOverrideCount: parsed.requestOverrideCount,
+			},
+		};
+	}
+
+	const parsed = parseApiKeyBatchInput(apiKeyInput, {
+		allowMultiple: allowBatch,
+	});
+	if (!parsed.ok) {
+		return parsed;
+	}
+	return {
+		ok: true,
+		parsed: {
+			entries: parsed.keys.map((apiKey) => ({ apiKey })),
+			duplicateCount: parsed.duplicateCount,
+			ignoredLineCount: parsed.ignoredLineCount,
+		},
+	};
+}
+
 async function addApiKeysFromModal(
 	accountManager: AccountManager,
 	provider: SupportedProviderId,
 	apiKeyInput: string,
 	allowBatch: boolean,
 ): Promise<{ message: string; credentialId: string }> {
-	const parsedInput = parseApiKeyBatchInput(apiKeyInput, {
-		allowMultiple: allowBatch,
-	});
-	if (!parsedInput.ok) {
-		throw new Error(parsedInput.message);
+	const parsedResult = parseProviderApiKeyInput(provider, apiKeyInput, allowBatch);
+	if (!parsedResult.ok) {
+		throw new Error(parsedResult.message);
 	}
+	const parsedInput = parsedResult.parsed;
 
 	const successfulAdds: Array<{
 		credentialId: string;
@@ -632,9 +687,13 @@ async function addApiKeysFromModal(
 	let latestCredentialIds: string[] = [];
 	let lastTouchedCredentialId: string | null = null;
 
-	for (const [index, key] of parsedInput.keys.entries()) {
+	for (const [index, entry] of parsedInput.entries.entries()) {
 		try {
-			const added = await accountManager.addApiKeyCredential(provider, key);
+			const added = await accountManager.addApiKeyCredential(
+				provider,
+				entry.apiKey,
+				entry.request ? { request: entry.request } : undefined,
+			);
 			latestCredentialIds = added.credentialIds;
 			lastTouchedCredentialId = added.credentialId;
 			deduplicatedCount += added.deduplicatedCount ?? 0;
@@ -685,6 +744,11 @@ async function addApiKeysFromModal(
 			`Skipped ${parsedInput.duplicateCount} duplicate line${parsedInput.duplicateCount === 1 ? "" : "s"}.`,
 		);
 	}
+	if (parsedInput.requestOverrideCount && parsedInput.requestOverrideCount > 0) {
+		detailParts.push(
+			`Applied Cloudflare account-scoped base URL to ${parsedInput.requestOverrideCount} key${parsedInput.requestOverrideCount === 1 ? "" : "s"}.`,
+		);
+	}
 	if (deduplicatedCount > 0) {
 		detailParts.push(
 			`Removed ${deduplicatedCount} existing duplicate credential${deduplicatedCount === 1 ? "" : "s"} from auth.json.`,
@@ -722,6 +786,7 @@ function createEmptyProviderStatus(provider: SupportedProviderId): ProviderStatu
 }
 
 interface CachedUsageDisplayReader {
+	hasUsageProvider?(provider: SupportedProviderId): boolean;
 	getCachedCredentialUsageDisplaySnapshot(
 		provider: SupportedProviderId,
 		credentialId: string,
@@ -736,6 +801,10 @@ export function hydrateStatusWithCachedUsage(
 	accountManager: CachedUsageDisplayReader,
 	status: ProviderStatus,
 ): ProviderStatus {
+	if (accountManager.hasUsageProvider && !accountManager.hasUsageProvider(status.provider)) {
+		return status;
+	}
+
 	let hasCachedUsage = false;
 	const credentials = status.credentials.map((credential) => {
 		const usage = accountManager.getCachedCredentialUsageDisplaySnapshot(
@@ -1321,6 +1390,7 @@ class MultiAuthManagerModal {
 			formatPlanDetailLabel(planType, Boolean(selectedCredential.usageSnapshotDisplayOnly)),
 			planType,
 		);
+		const hasUsageApi = this.accountManager.hasUsageProvider(status.provider);
 		const selectionMode = selectedCredential.isManualActive
 			? "Manual active (persists across sessions/restarts)"
 			: "Automatic";
@@ -1329,16 +1399,20 @@ class MultiAuthManagerModal {
 			`ID:        ${selectedCredential.credentialId}`,
 			`Type:      ${selectedCredential.credentialType}`,
 			`Auth:      ${selectedCredential.redactedSecret}`,
-			`Plan:      ${planLabel}`,
+			...(hasUsageApi ? [`Plan:      ${planLabel}`] : []),
 			`State:     ${state.label}`,
 			`Selection: ${selectionMode}`,
 			`Marked:    ${this.isCredentialBatchSelected(status.provider, selectedCredential.credentialId) ? "Batch delete queue" : "No"}`,
 			`Rotation:  ${formatRotationModeLabel(status.rotationMode)}`,
 			`Usage:     ${selectedCredential.usageCount} requests`,
-			"",
-			`${BORDER_GLYPHS.horizontal.repeat(2)} Usage & Quota ${BORDER_GLYPHS.horizontal.repeat(2)}`,
-			...this.buildUsageDetailLines(selectedCredential, safeDetailWidth),
 		];
+		if (hasUsageApi) {
+			detailLines.push(
+				"",
+				`${BORDER_GLYPHS.horizontal.repeat(2)} Usage & Quota ${BORDER_GLYPHS.horizontal.repeat(2)}`,
+				...this.buildUsageDetailLines(selectedCredential, safeDetailWidth),
+			);
+		}
 		if (batchSelectionCount > 0) {
 			detailLines.push("");
 			detailLines.push(
@@ -1396,6 +1470,14 @@ class MultiAuthManagerModal {
 		return detailLines;
 	}
 
+	private buildUsageAdvisoryLines(credential: CredentialStatus, detailWidth: number): string[] {
+		const lines = credential.usageSnapshotDisplayOnly ? ["Last known usage data."] : [];
+		if (credential.usageFetchError) {
+			lines.push(...wrapDetailMessageLines(credential.usageFetchError, detailWidth));
+		}
+		return lines;
+	}
+
 	private buildUsageDetailLines(credential: CredentialStatus, detailWidth: number): string[] {
 		const snapshot = credential.usageSnapshot;
 		if (!snapshot) {
@@ -1406,9 +1488,9 @@ class MultiAuthManagerModal {
 		}
 
 		const barWidth = clamp(Math.floor(detailWidth * 0.45), 10, 26);
-		const lastKnownPrefix = credential.usageSnapshotDisplayOnly ? ["Last known usage data."] : [];
+		const usageAdvisoryLines = this.buildUsageAdvisoryLines(credential, detailWidth);
 		if (snapshot.copilotQuota) {
-			const lines: string[] = [...lastKnownPrefix];
+			const lines: string[] = [...usageAdvisoryLines];
 			const chat = snapshot.copilotQuota.chat;
 			lines.push("Chat Completions");
 			lines.push(renderProgressBar(chat.percentUsed, barWidth));
@@ -1437,7 +1519,7 @@ class MultiAuthManagerModal {
 			return lines;
 		}
 
-		const lines: string[] = [...lastKnownPrefix];
+		const lines: string[] = [...usageAdvisoryLines];
 		if (snapshot.primary) {
 			lines.push(resolveUsageWindowLabel(snapshot, "primary"));
 			lines.push(renderProgressBar(snapshot.primary.usedPercent, barWidth));
@@ -1457,7 +1539,7 @@ class MultiAuthManagerModal {
 				lines.push(`Resets in ${reset}`);
 			}
 		}
-		if (lines.length === lastKnownPrefix.length) {
+		if (lines.length === usageAdvisoryLines.length) {
 			lines.push("Usage unavailable");
 		}
 		return lines;
@@ -1937,9 +2019,12 @@ class MultiAuthManagerModal {
 	): Promise<{ message: string; credentialId: string } | null> {
 		const capabilities = this.accountManager.getProviderCapabilities(provider);
 		const supportsBatchAdd = !capabilities.supportsOAuth;
+		const cloudflareHint = isCloudflareWorkersAiProvider(provider)
+			? " Include an account ID, dashboard token URL, or Workers AI base URL to skip account discovery."
+			: "";
 		const apiKeyInput = supportsBatchAdd
-			? await this.ctx.ui.editor(`Paste API key(s) for ${provider} (one per line):`)
-			: await this.ctx.ui.input(`Paste API key for ${provider}:`);
+			? await this.ctx.ui.editor(`Paste API key(s) for ${provider} (one per line).${cloudflareHint}`)
+			: await this.ctx.ui.input(`Paste API key for ${provider}.${cloudflareHint}`);
 		if (!apiKeyInput) {
 			return null;
 		}
@@ -2120,9 +2205,12 @@ class MultiAuthManagerModal {
 		);
 
 		const isApiKeyCredential = selectedEntry.credential.credentialType === "api_key";
+		const hasUsageApi = this.accountManager.hasUsageProvider(status.provider);
 		this.runAction(
 			isApiKeyCredential
-				? `Refreshing usage state for ${selectedEntry.credential.credentialId}...`
+				? hasUsageApi
+					? `Refreshing usage state for ${selectedEntry.credential.credentialId}...`
+					: `Checking ${selectedEntry.credential.credentialId}...`
 				: `Refreshing token for ${selectedEntry.credential.credentialId}...`,
 			async () => {
 				const refreshResult = !isApiKeyCredential
@@ -2131,16 +2219,18 @@ class MultiAuthManagerModal {
 							selectedEntry.credential.credentialId,
 						)
 					: null;
-				const usage = await this.accountManager.getCredentialUsageSnapshot(
-					status.provider,
-					selectedEntry.credential.credentialId,
-					{
-						forceRefresh: true,
-						coordinationOperation: "manual-account-refresh",
-					},
-				);
+				const usage = hasUsageApi
+					? await this.accountManager.getCredentialUsageSnapshot(
+						status.provider,
+						selectedEntry.credential.credentialId,
+						{
+							forceRefresh: true,
+							coordinationOperation: "manual-account-refresh",
+						},
+					)
+					: null;
 				await this.reloadStatuses(preserveSelection);
-				if (usage.error) {
+				if (usage?.error) {
 					if (isApiKeyCredential) {
 						return `Credential checked for ${displayName}. Usage warning: ${usage.error}.`;
 					}
@@ -2247,12 +2337,14 @@ class MultiAuthManagerModal {
 		const preserveSelection = this.getCurrentSelectionAnchor();
 		const usageByCredentialKey = new Map<string, CredentialUsageDisplayState>();
 		const credentials = this.statuses.flatMap((status) =>
-			status.credentials.map((credential) => ({
-				provider: status.provider,
-				credentialId: credential.credentialId,
-			})),
+			this.accountManager.hasUsageProvider(status.provider)
+				? status.credentials.map((credential) => ({
+					provider: status.provider,
+					credentialId: credential.credentialId,
+				}))
+				: [],
 		);
-		const refreshCandidates = this.accountManager.selectUsageRefreshCandidates(
+		const refreshCandidateWindows = this.accountManager.selectUsageRefreshCandidateWindows(
 			credentials,
 			"modal-refresh",
 		);
@@ -2284,35 +2376,37 @@ class MultiAuthManagerModal {
 			return;
 		}
 
-		const freshTasks = refreshCandidates.map(async ({ provider, credentialId }) => {
-			const credentialKey = this.getCredentialMapKey(provider, credentialId);
-			try {
-				const usage = await this.accountManager.getCredentialUsageSnapshot(provider, credentialId, {
-					forceRefresh: true,
-					coordinationOperation: "modal-refresh",
-				});
-				const previousUsageState = usageByCredentialKey.get(credentialKey);
-				const hasFreshSnapshot = usage.snapshot !== null;
-				applyUsageState(provider, credentialId, {
-					usageSnapshot: usage.snapshot ?? previousUsageState?.usageSnapshot ?? null,
-					usageFetchError: usage.error ?? previousUsageState?.usageFetchError,
-					usageSnapshotDisplayOnly: hasFreshSnapshot
-						? usage.displayOnly
-						: previousUsageState?.usageSnapshotDisplayOnly,
-				});
-			} catch (error: unknown) {
-				const previousUsageState = usageByCredentialKey.get(credentialKey);
-				applyUsageState(provider, credentialId, {
-					usageSnapshot: previousUsageState?.usageSnapshot ?? null,
-					usageFetchError: `Usage unavailable (${getErrorMessage(error)})`,
-					usageSnapshotDisplayOnly: previousUsageState?.usageSnapshotDisplayOnly,
-				});
-			}
-		});
+		for (const refreshCandidates of refreshCandidateWindows) {
+			const freshTasks = refreshCandidates.map(async ({ provider, credentialId }) => {
+				const credentialKey = this.getCredentialMapKey(provider, credentialId);
+				try {
+					const usage = await this.accountManager.getCredentialUsageSnapshot(provider, credentialId, {
+						forceRefresh: true,
+						coordinationOperation: "modal-refresh",
+					});
+					const previousUsageState = usageByCredentialKey.get(credentialKey);
+					const hasFreshSnapshot = usage.snapshot !== null;
+					applyUsageState(provider, credentialId, {
+						usageSnapshot: usage.snapshot ?? previousUsageState?.usageSnapshot ?? null,
+						usageFetchError: usage.error ?? previousUsageState?.usageFetchError,
+						usageSnapshotDisplayOnly: hasFreshSnapshot
+							? usage.displayOnly
+							: previousUsageState?.usageSnapshotDisplayOnly,
+					});
+				} catch (error: unknown) {
+					const previousUsageState = usageByCredentialKey.get(credentialKey);
+					applyUsageState(provider, credentialId, {
+						usageSnapshot: previousUsageState?.usageSnapshot ?? null,
+						usageFetchError: `Usage unavailable (${getErrorMessage(error)})`,
+						usageSnapshotDisplayOnly: previousUsageState?.usageSnapshotDisplayOnly,
+					});
+				}
+			});
 
-		await Promise.allSettled(freshTasks);
-		if (refreshEpoch !== this.usageRefreshEpoch) {
-			return;
+			await Promise.allSettled(freshTasks);
+			if (refreshEpoch !== this.usageRefreshEpoch) {
+				return;
+			}
 		}
 
 		const latestStatuses = await loadAllProviderStatuses(this.accountManager);

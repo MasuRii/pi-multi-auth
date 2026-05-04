@@ -15,6 +15,7 @@ import {
 } from "./auth-error-utils.js";
 import { extractCodexCredentialIdentity } from "./openai-codex-identity.js";
 import { determineTokenExpiration } from "./oauth-refresh-scheduler.js";
+import { isRemovedLegacyGoogleProvider } from "./removed-google-providers.js";
 import {
 	OAuthRefreshFailureError,
 	UNSUPPORTED_OAUTH_REFRESH_PROVIDER_ERROR_CODE,
@@ -269,11 +270,16 @@ async function refreshOpenAICodexCredential(
 export function getOAuthProvider(
 	id: OAuthProviderId,
 ): OAuthProviderInterface | undefined {
+	if (isRemovedLegacyGoogleProvider(id)) {
+		return undefined;
+	}
 	return getOAuthProviderFromPiAi(id);
 }
 
 export function getOAuthProviders(): OAuthProviderInterface[] {
-	return getOAuthProvidersFromPiAi();
+	return getOAuthProvidersFromPiAi().filter(
+		(provider) => !isRemovedLegacyGoogleProvider(provider.id),
+	);
 }
 
 export function registerOAuthProvider(provider: OAuthProviderInterface): void {
@@ -297,6 +303,18 @@ export async function refreshOAuthCredential(
 	credentials: OAuthCredentials,
 	options: OAuthRefreshExecutionOptions = {},
 ): Promise<OAuthCredentials> {
+	if (isRemovedLegacyGoogleProvider(providerId)) {
+		throw new OAuthRefreshFailureError(
+			"Legacy Google OAuth providers are no longer supported for token refresh.",
+			{
+				providerId,
+				permanent: true,
+				source: "extension",
+				errorCode: UNSUPPORTED_OAUTH_REFRESH_PROVIDER_ERROR_CODE,
+			},
+		);
+	}
+
 	if (providerId === OPENAI_CODEX_PROVIDER_ID) {
 		const requestTimeoutMs =
 			typeof options.requestTimeoutMs === "number" &&

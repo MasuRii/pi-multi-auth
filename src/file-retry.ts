@@ -1,3 +1,6 @@
+import { sleep } from "./async-utils.js";
+import { toError } from "./auth-error-utils.js";
+
 type RetryCallbackDetails = {
 	attempt: number;
 	maxAttempts: number;
@@ -48,24 +51,6 @@ const DEFAULT_RETRY_ATTEMPTS = 6;
 const DEFAULT_RETRY_BASE_DELAY_MS = 25;
 const DEFAULT_RETRY_MAX_DELAY_MS = 200;
 const RETRYABLE_FILE_ACCESS_ERROR_CODES = new Set(["EACCES", "EBUSY", "EPERM", "UNKNOWN"]);
-
-function toError(error: unknown): Error {
-	if (error instanceof Error) {
-		return error;
-	}
-
-	return new Error(String(error));
-}
-
-function sleep(ms: number): Promise<void> {
-	if (ms <= 0) {
-		return Promise.resolve();
-	}
-
-	return new Promise((resolve) => {
-		setTimeout(resolve, ms);
-	});
-}
 
 function getRetryDelayMs(attempt: number, baseDelayMs: number, maxDelayMs: number): number {
 	return Math.min(maxDelayMs, baseDelayMs * Math.pow(2, attempt - 1));

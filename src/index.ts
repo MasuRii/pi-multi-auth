@@ -10,6 +10,7 @@ import { loadMultiAuthConfig } from "./config.js";
 import { multiAuthDebugLogger } from "./debug-logger.js";
 import { registerMultiAuthProviders } from "./provider.js";
 import { registerClineOAuthProvider } from "./oauth-cline.js";
+import { registerKiloOAuthProvider } from "./oauth-kilo.js";
 import {
 	isDelegatedSubagentRuntime,
 	resolveRequestedProviderFromArgv,
@@ -33,6 +34,7 @@ interface SessionStartEvent {
 export default async function multiAuthExtension(pi: ExtensionAPI): Promise<void> {
 	const configLoadResult = loadMultiAuthConfig();
 	registerClineOAuthProvider();
+	registerKiloOAuthProvider();
 	const isSubagentRuntime = isDelegatedSubagentRuntime();
 	const requestedSubagentProvider = isSubagentRuntime
 		? resolveRequestedProviderFromArgv()

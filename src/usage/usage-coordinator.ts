@@ -48,6 +48,41 @@ export interface UsageRequestDescriptor {
 	operation: UsageCoordinationOperation;
 }
 
+export type UsageRequestDeferralReason = "credential_cooldown";
+
+interface UsageRequestDeferral {
+	reason: UsageRequestDeferralReason;
+	retryAt: number;
+	message: string;
+}
+
+export class UsageRequestDeferredError extends Error {
+	readonly provider: string;
+	readonly credentialId: string;
+	readonly reason: UsageRequestDeferralReason;
+	readonly retryAt: number;
+
+	constructor(descriptor: UsageRequestDescriptor, deferral: UsageRequestDeferral) {
+		super(deferral.message);
+		this.name = "UsageRequestDeferredError";
+		this.provider = descriptor.provider;
+		this.credentialId = descriptor.credentialId;
+		this.reason = deferral.reason;
+		this.retryAt = deferral.retryAt;
+	}
+}
+
+export function isUsageRequestDeferredError(error: unknown): error is UsageRequestDeferredError {
+	return error instanceof UsageRequestDeferredError;
+}
+
+export function formatUsageRequestDeferredNote(error: UsageRequestDeferredError): string {
+	const retrySuffix = error.retryAt > Date.now()
+		? ` until ${new Date(error.retryAt).toISOString()}`
+		: "";
+	return `Live usage refresh deferred${retrySuffix}; showing last-known usage when available.`;
+}
+
 interface QueueEntry {
 	descriptor: UsageRequestDescriptor;
 	run: () => Promise<unknown>;
@@ -57,9 +92,6 @@ interface QueueEntry {
 
 interface ProviderPolicyState {
 	inFlight: number;
-	consecutiveFailures: number;
-	circuitOpenUntil: number;
-	cooldownUntil: number;
 }
 
 const PROGRESSIVE_WINDOW_OPERATIONS = new Set<UsageCoordinationOperation>([
@@ -95,16 +127,6 @@ function redactIdentifier(value: string): string {
 		hash = Math.imul(hash, 0x01000193) >>> 0;
 	}
 	return `id:${hash.toString(16).padStart(8, "0")}`;
-}
-
-function classifyUsagePolicyFailure(message: string): "auth" | "rate-limit" | "transient" {
-	if (/\b401\b|\b403\b|unauthorized|forbidden|expired|invalid|denied|token/i.test(message)) {
-		return "auth";
-	}
-	if (/\b429\b|rate.?limit|too many requests|abuse|quota/i.test(message)) {
-		return "rate-limit";
-	}
-	return "transient";
 }
 
 function getOperationWindow(
@@ -348,9 +370,8 @@ export class UsageCoordinator {
 			providers: [...this.providerState.entries()].map(([provider, state]) => ({
 				provider,
 				inFlight: state.inFlight,
-				consecutiveFailures: state.consecutiveFailures,
-				circuitOpen: state.circuitOpenUntil > Date.now(),
 			})),
+			credentialCooldowns: this.getRedactedCredentialCooldowns(Date.now()),
 		};
 	}
 
@@ -397,27 +418,27 @@ export class UsageCoordinator {
 	}
 
 	private assertRequestPolicyAllows(descriptor: UsageRequestDescriptor): void {
-		const now = Date.now();
-		const providerState = this.getProviderState(descriptor.provider);
-		if (providerState.circuitOpenUntil > now) {
-			throw new Error(
-				`Fresh usage request deferred for ${descriptor.provider}: provider circuit is open until ${new Date(providerState.circuitOpenUntil).toISOString()}.`,
-			);
+		const deferral = this.resolveRequestDeferral(descriptor, Date.now());
+		if (deferral) {
+			throw new UsageRequestDeferredError(descriptor, deferral);
 		}
-		if (providerState.cooldownUntil > now) {
-			throw new Error(
-				`Fresh usage request deferred for ${descriptor.provider}: provider usage cooldown is active until ${new Date(providerState.cooldownUntil).toISOString()}.`,
-			);
-		}
+	}
 
+	private resolveRequestDeferral(
+		descriptor: UsageRequestDescriptor,
+		now: number,
+	): UsageRequestDeferral | null {
 		const accountCooldown = this.accountCooldownUntil.get(
 			this.accountKey(descriptor.provider, descriptor.credentialId),
 		) ?? 0;
 		if (accountCooldown > now) {
-			throw new Error(
-				`Fresh usage request deferred for ${descriptor.provider}: credential usage cooldown is active until ${new Date(accountCooldown).toISOString()}.`,
-			);
+			return {
+				reason: "credential_cooldown",
+				retryAt: accountCooldown,
+				message: `Fresh usage request deferred for ${descriptor.provider}: credential usage cooldown is active until ${new Date(accountCooldown).toISOString()}.`,
+			};
 		}
+		return null;
 	}
 
 	private drainQueue(): void {
@@ -494,42 +515,22 @@ export class UsageCoordinator {
 			});
 	}
 
-	private recordSuccess(provider: string): void {
-		const providerState = this.getProviderState(provider);
-		providerState.consecutiveFailures = 0;
-		providerState.cooldownUntil = 0;
+	private recordSuccess(_provider: string): void {
+		// Usage lookups are advisory; successful metadata refreshes do not need provider-level recovery state.
 	}
 
-	private recordFailure(descriptor: UsageRequestDescriptor, error: unknown): void {
-		const providerState = this.getProviderState(descriptor.provider);
-		providerState.consecutiveFailures += 1;
-
-		const message = error instanceof Error ? error.message : String(error);
-		const failureKind = classifyUsagePolicyFailure(message);
+	private recordFailure(descriptor: UsageRequestDescriptor, _error: unknown): void {
 		const now = Date.now();
 		const jitter = this.resolveJitterMs(descriptor.provider, descriptor.credentialId);
 		const accountCooldownMs = this.config.accountCooldownMs + jitter;
+		if (accountCooldownMs <= 0) {
+			this.accountCooldownUntil.delete(this.accountKey(descriptor.provider, descriptor.credentialId));
+			return;
+		}
 		this.accountCooldownUntil.set(
 			this.accountKey(descriptor.provider, descriptor.credentialId),
 			now + accountCooldownMs,
 		);
-
-		if (failureKind === "rate-limit") {
-			providerState.cooldownUntil = Math.max(
-				providerState.cooldownUntil,
-				now + this.config.providerCooldownMs + jitter,
-			);
-		}
-
-		if (
-			failureKind === "auth" ||
-			providerState.consecutiveFailures >= this.config.circuitBreakerFailureThreshold
-		) {
-			providerState.circuitOpenUntil = Math.max(
-				providerState.circuitOpenUntil,
-				now + this.config.circuitBreakerCooldownMs + jitter,
-			);
-		}
 	}
 
 	private getProviderState(provider: string): ProviderPolicyState {
@@ -539,12 +540,31 @@ export class UsageCoordinator {
 		}
 		const created: ProviderPolicyState = {
 			inFlight: 0,
-			consecutiveFailures: 0,
-			circuitOpenUntil: 0,
-			cooldownUntil: 0,
 		};
 		this.providerState.set(provider, created);
 		return created;
+	}
+
+	private getRedactedCredentialCooldowns(now: number): Array<{
+		provider: string;
+		credentialRef: string;
+		retryAt: number;
+	}> {
+		const cooldowns: Array<{ provider: string; credentialRef: string; retryAt: number }> = [];
+		for (const [key, retryAt] of this.accountCooldownUntil.entries()) {
+			if (retryAt <= now) {
+				continue;
+			}
+			const separatorIndex = key.indexOf("\u0000");
+			const provider = separatorIndex >= 0 ? key.slice(0, separatorIndex) : "unknown";
+			const credentialId = separatorIndex >= 0 ? key.slice(separatorIndex + 1) : key;
+			cooldowns.push({
+				provider,
+				credentialRef: redactIdentifier(credentialId),
+				retryAt,
+			});
+		}
+		return cooldowns;
 	}
 
 	private resolveJitterMs(provider: string, credentialId: string): number {
@@ -560,6 +580,6 @@ export class UsageCoordinator {
 	}
 
 	private accountKey(provider: string, credentialId: string): string {
-		return `${provider}:${credentialId}`;
+		return `${provider}\u0000${credentialId}`;
 	}
 }

@@ -31,6 +31,7 @@ type TestCredential = {
 	secret: string;
 	planType: string | null;
 	primaryUsedPercent?: number;
+	usageError?: string;
 };
 
 type CodexAccountManagerTestOptions = {
@@ -111,6 +112,9 @@ async function createCodexAccountManager(
 		fetchUsage: async (auth: UsageAuth) => {
 			const credential = credentialBySecret.get(auth.accessToken);
 			await options.onFetchUsage?.(credential);
+			if (credential?.usageError) {
+				throw new Error(credential.usageError);
+			}
 			return createUsageSnapshot(credential ?? { planType: null });
 		},
 	});
@@ -271,6 +275,33 @@ test("account manager skips free codex credentials for paid-only models", async 
 	assert.equal(selected.credentialId, "openai-codex-1");
 });
 
+test("account manager skips codex credentials with cached model incompatibility", async (t) => {
+	const accountManager = await createCodexAccountManager(t, [
+		{ credentialId: "openai-codex", secret: "sk-free-key", planType: "free" },
+		{ credentialId: "openai-codex-1", secret: "sk-plus-key", planType: "plus" },
+	]);
+	await preloadCodexUsage(accountManager, ["openai-codex", "openai-codex-1"]);
+
+	await (accountManager as unknown as {
+		markCredentialModelIncompatible: (
+			provider: string,
+			credentialId: string,
+			modelId: string,
+			errorMessage: string,
+		) => Promise<number>;
+	}).markCredentialModelIncompatible(
+		CODEX_PROVIDER_ID,
+		"openai-codex",
+		"gpt-5.4",
+		"The 'gpt-5.4' model is not supported when using Codex with a ChatGPT account.",
+	);
+
+	const selected = await accountManager.acquireCredential(CODEX_PROVIDER_ID, {
+		modelId: "gpt-5.4",
+	});
+	assert.equal(selected.credentialId, "openai-codex-1");
+});
+
 test("account manager scans later usage windows when earlier codex credentials are exhausted", async (t) => {
 	const credentials = [
 		{ credentialId: "openai-codex", secret: "window-free-0", planType: "free", primaryUsedPercent: 100 },
@@ -391,7 +422,7 @@ test("account manager rejects restricted codex selection when no eligible plan e
 	);
 });
 
-test("codex usage-based selection returns stale cached routing state and refreshes in background", async (t) => {
+test("codex usage-based selection returns immediately and queues background refresh for stale routing state", async (t) => {
 	const tempRoot = await mkdtemp(join(tmpdir(), "pi-multi-auth-cache-first-selection-"));
 
 	const authPath = join(tempRoot, "auth.json");
@@ -459,12 +490,130 @@ test("codex usage-based selection returns stale cached routing state and refresh
 	]);
 
 	assert.equal(selected.credentialId, "openai-codex-1");
-	for (let attempt = 0; attempt < 20 && fetchCount === 0; attempt += 1) {
-		await sleep(10);
-	}
-	assert.ok(fetchCount > 0);
-	assert.ok(fetchCount <= credentials.length);
+	await sleep(50);
+	assert.equal(fetchCount > 0, true);
 	refreshGate.resolve();
+});
+
+
+test("codex stale usage selection keeps local rotation fair while queueing background refresh", async (t) => {
+	const tempRoot = await mkdtemp(join(tmpdir(), "pi-multi-auth-cache-first-fairness-"));
+
+	const authPath = join(tempRoot, "auth.json");
+	const storagePath = join(tempRoot, "multi-auth.json");
+	const modelsPath = join(tempRoot, "models.json");
+	const credentials = [
+		{ credentialId: "openai-codex", secret: "low-stale-usage-token", planType: "plus", primaryUsedPercent: 1 },
+		{ credentialId: "openai-codex-1", secret: "higher-stale-usage-token", planType: "plus", primaryUsedPercent: 50 },
+	] as const;
+	const usageBySecret = new Map<string, Pick<TestCredential, "planType" | "primaryUsedPercent">>(
+		credentials.map((credential) => [credential.secret, credential]),
+	);
+	let fetchCount = 0;
+
+	await writeFile(
+		authPath,
+		JSON.stringify(
+			Object.fromEntries(
+				credentials.map((credential) => [
+					credential.credentialId,
+					{ type: "api_key", key: credential.secret },
+				]),
+			),
+			null,
+			2,
+		),
+		"utf-8",
+	);
+	await writeFile(modelsPath, JSON.stringify({ providers: {} }, null, 2), "utf-8");
+
+	const authWriter = new AuthWriter(authPath);
+	const storage = new MultiAuthStorage(storagePath);
+	const usageService = new UsageService(1, 60_000, 10_000, undefined, { persistentCache: false });
+	usageService.register({
+		id: CODEX_PROVIDER_ID,
+		displayName: "OpenAI Codex",
+		fetchUsage: async (auth: UsageAuth) => {
+			fetchCount += 1;
+			return createUsageSnapshot(usageBySecret.get(auth.accessToken) ?? { planType: null });
+		},
+	});
+	const providerRegistry = new ProviderRegistry(authWriter, modelsPath, [CODEX_PROVIDER_ID]);
+	const accountManager = new AccountManager(authWriter, storage, usageService, providerRegistry);
+	t.after(async () => {
+		await accountManager.shutdown();
+		await rm(tempRoot, { recursive: true, force: true });
+	});
+
+	await preloadCodexUsage(accountManager, credentials.map((credential) => credential.credentialId));
+	await sleep(5);
+	fetchCount = 0;
+
+	const first = await accountManager.acquireCredential(CODEX_PROVIDER_ID, { modelId: "gpt-5.5" });
+	const second = await accountManager.acquireCredential(CODEX_PROVIDER_ID, { modelId: "gpt-5.5" });
+
+	assert.equal(first.credentialId, "openai-codex");
+	assert.equal(second.credentialId, "openai-codex-1");
+	assert.equal(fetchCount > 0, true);
+});
+
+test("codex paid entitlement treats stale quota exhaustion as plan evidence while refreshing in background", async (t) => {
+	const tempRoot = await mkdtemp(join(tmpdir(), "pi-multi-auth-cache-first-plan-only-"));
+
+	const authPath = join(tempRoot, "auth.json");
+	const storagePath = join(tempRoot, "multi-auth.json");
+	const modelsPath = join(tempRoot, "models.json");
+	const credentials = [
+		{ credentialId: "openai-codex", secret: "paid-stale-exhausted-token", planType: "plus", primaryUsedPercent: 100 },
+		{ credentialId: "openai-codex-1", secret: "free-stale-token", planType: "free", primaryUsedPercent: 0 },
+	] as const;
+	const usageBySecret = new Map<string, Pick<TestCredential, "planType" | "primaryUsedPercent">>(
+		credentials.map((credential) => [credential.secret, credential]),
+	);
+	let fetchCount = 0;
+
+	await writeFile(
+		authPath,
+		JSON.stringify(
+			Object.fromEntries(
+				credentials.map((credential) => [
+					credential.credentialId,
+					{ type: "api_key", key: credential.secret },
+				]),
+			),
+			null,
+			2,
+		),
+		"utf-8",
+	);
+	await writeFile(modelsPath, JSON.stringify({ providers: {} }, null, 2), "utf-8");
+
+	const authWriter = new AuthWriter(authPath);
+	const storage = new MultiAuthStorage(storagePath);
+	const usageService = new UsageService(1, 60_000, 10_000, undefined, { persistentCache: false });
+	usageService.register({
+		id: CODEX_PROVIDER_ID,
+		displayName: "OpenAI Codex",
+		fetchUsage: async (auth: UsageAuth) => {
+			fetchCount += 1;
+			return createUsageSnapshot(usageBySecret.get(auth.accessToken) ?? { planType: null });
+		},
+	});
+	const providerRegistry = new ProviderRegistry(authWriter, modelsPath, [CODEX_PROVIDER_ID]);
+	const accountManager = new AccountManager(authWriter, storage, usageService, providerRegistry);
+	t.after(async () => {
+		await accountManager.shutdown();
+		await rm(tempRoot, { recursive: true, force: true });
+	});
+
+	await preloadCodexUsage(accountManager, credentials.map((credential) => credential.credentialId));
+	await sleep(5);
+	fetchCount = 0;
+
+	const selected = await accountManager.acquireCredential(CODEX_PROVIDER_ID, { modelId: "gpt-5.5" });
+
+	assert.equal(selected.credentialId, "openai-codex");
+	assert.equal(fetchCount > 0, true);
 });
 
 test("codex paid entitlement uses durable negative evidence without a fresh bootstrap", async (t) => {

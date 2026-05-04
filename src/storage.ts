@@ -1,16 +1,18 @@
 import { constants as fsConstants } from "node:fs";
 import { access, chmod, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { sleep } from "./async-utils.js";
 import {
 	DEBUG_DIR,
 	DEFAULT_HISTORY_PERSISTENCE_CONFIG,
 	cloneHistoryPersistenceConfig,
 	type HistoryPersistenceConfig,
 } from "./config.js";
-import { getErrorMessage } from "./auth-error-utils.js";
+import { getErrorMessage, isRecord, toError } from "./auth-error-utils.js";
 import { isRetryableFileAccessError, readTextSnapshotWithRetries, writeTextSnapshotWithRetries } from "./file-retry.js";
 import { MultiAuthHistoryStore } from "./history-storage.js";
 import { RollingMetricSeries, type MetricSeriesSnapshot } from "./performance-metrics.js";
+import { cloneProviderState } from "./provider-state-utils.js";
 import { resolveDefaultRotationMode } from "./rotation-modes.js";
 import { resolveAgentRuntimePath } from "./runtime-paths.js";
 import { DEFAULT_PROVIDER_POOL_CONFIG, type ProviderPoolConfig } from "./types-pool.js";
@@ -67,24 +69,6 @@ export interface MultiAuthStorageMetrics {
 export interface MultiAuthStorageOptions {
 	debugDir?: string;
 	historyPersistence?: HistoryPersistenceConfig;
-}
-
-function toError(error: unknown): Error {
-	if (error instanceof Error) {
-		return error;
-	}
-
-	return new Error(String(error));
-}
-
-function sleep(ms: number): Promise<void> {
-	if (ms <= 0) {
-		return Promise.resolve();
-	}
-
-	return new Promise((resolve) => {
-		setTimeout(resolve, ms);
-	});
 }
 
 function lockDirPath(filePath: string): string {
@@ -189,6 +173,7 @@ export function createEmptyProviderState(
 		chains: undefined,
 		activeChain: undefined,
 		quotaStates: undefined,
+		modelIncompatibilities: undefined,
 	};
 }
 
@@ -238,10 +223,6 @@ async function ensureFileExists(filePath: string): Promise<void> {
 
 function getDefaultMultiAuthPath(): string {
 	return resolveAgentRuntimePath("multi-auth.json");
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function parseProviderState(
@@ -300,17 +281,18 @@ function parseProviderState(
 		chains: parseChains(value.chains),
 		activeChain: parseActiveChain(value.activeChain),
 		quotaStates: parseQuotaStates(value.quotaStates),
+		modelIncompatibilities: parseModelIncompatibilities(value.modelIncompatibilities),
 	};
 }
 
 function parseDisabledCredentials(
 	value: unknown,
-): Record<string, { error: string; disabledAt: number }> {
+): ProviderRotationState["disabledCredentials"] {
 	if (!isRecord(value)) {
 		return {};
 	}
 
-	const result: Record<string, { error: string; disabledAt: number }> = {};
+	const result: ProviderRotationState["disabledCredentials"] = {};
 	for (const [credentialId, entry] of Object.entries(value)) {
 		if (!isRecord(entry)) {
 			continue;
@@ -320,8 +302,13 @@ function parseDisabledCredentials(
 			typeof entry.disabledAt === "number" && Number.isFinite(entry.disabledAt)
 				? entry.disabledAt
 				: Date.now();
+		const planType = typeof entry.planType === "string" ? entry.planType.trim() : "";
 		if (error) {
-			result[credentialId] = { error, disabledAt };
+			result[credentialId] = {
+				error,
+				disabledAt,
+				...(planType ? { planType } : {}),
+			};
 		}
 	}
 	return result;
@@ -628,6 +615,50 @@ function parseQuotaStates(value: unknown): ProviderRotationState["quotaStates"] 
 	return Object.keys(result).length > 0 ? result : undefined;
 }
 
+function parseModelIncompatibilities(
+	value: unknown,
+): ProviderRotationState["modelIncompatibilities"] {
+	if (!isRecord(value)) {
+		return undefined;
+	}
+
+	const result: NonNullable<ProviderRotationState["modelIncompatibilities"]> = {};
+	for (const [credentialId, models] of Object.entries(value)) {
+		if (!isRecord(models)) {
+			continue;
+		}
+		const modelEntries: Record<string, NonNullable<ProviderRotationState["modelIncompatibilities"]>[string][string]> = {};
+		for (const [modelId, entry] of Object.entries(models)) {
+			if (!isRecord(entry)) {
+				continue;
+			}
+			const normalizedModelId = modelId.trim().toLowerCase();
+			const error = typeof entry.error === "string" ? entry.error.trim() : "";
+			const blockedUntil = typeof entry.blockedUntil === "number" && Number.isFinite(entry.blockedUntil)
+				? entry.blockedUntil
+				: 0;
+			if (!normalizedModelId || !error || blockedUntil <= 0) {
+				continue;
+			}
+			modelEntries[normalizedModelId] = {
+				modelId: typeof entry.modelId === "string" && entry.modelId.trim().length > 0
+					? entry.modelId.trim().toLowerCase()
+					: normalizedModelId,
+				blockedUntil,
+				blockedAt: typeof entry.blockedAt === "number" && Number.isFinite(entry.blockedAt)
+					? entry.blockedAt
+					: Date.now(),
+				error,
+			};
+		}
+		if (Object.keys(modelEntries).length > 0) {
+			result[credentialId] = modelEntries;
+		}
+	}
+
+	return Object.keys(result).length > 0 ? result : undefined;
+}
+
 function parseNumberMap(value: unknown): Record<string, number> {
 	if (!isRecord(value)) {
 		return {};
@@ -759,46 +790,6 @@ function cloneState(state: MultiAuthState): MultiAuthState {
 		ui: {
 			hiddenProviders: [...state.ui.hiddenProviders],
 		},
-	};
-}
-
-function cloneProviderState(state: ProviderRotationState): ProviderRotationState {
-	return {
-		credentialIds: [...state.credentialIds],
-		activeIndex: state.activeIndex,
-		rotationMode: state.rotationMode,
-		manualActiveCredentialId: state.manualActiveCredentialId,
-		lastUsedAt: { ...state.lastUsedAt },
-		usageCount: { ...state.usageCount },
-		quotaErrorCount: { ...state.quotaErrorCount },
-		quotaExhaustedUntil: { ...state.quotaExhaustedUntil },
-		lastQuotaError: { ...state.lastQuotaError },
-		lastTransientError: { ...state.lastTransientError },
-		transientErrorCount: { ...state.transientErrorCount },
-		weeklyQuotaAttempts: { ...state.weeklyQuotaAttempts },
-		friendlyNames: { ...state.friendlyNames },
-		disabledCredentials: { ...state.disabledCredentials },
-		cascadeState: state.cascadeState
-			? JSON.parse(JSON.stringify(state.cascadeState)) as ProviderRotationState["cascadeState"]
-			: undefined,
-		healthState: state.healthState
-			? JSON.parse(JSON.stringify(state.healthState)) as ProviderRotationState["healthState"]
-			: undefined,
-		oauthRefreshScheduled: { ...(state.oauthRefreshScheduled ?? {}) },
-		pools: state.pools
-			? JSON.parse(JSON.stringify(state.pools)) as ProviderRotationState["pools"]
-			: undefined,
-		poolConfig: state.poolConfig ? { ...state.poolConfig } : undefined,
-		poolState: state.poolState ? { ...state.poolState } : undefined,
-		chains: state.chains
-			? JSON.parse(JSON.stringify(state.chains)) as ProviderRotationState["chains"]
-			: undefined,
-		activeChain: state.activeChain
-			? JSON.parse(JSON.stringify(state.activeChain)) as ProviderRotationState["activeChain"]
-			: undefined,
-		quotaStates: state.quotaStates
-			? JSON.parse(JSON.stringify(state.quotaStates)) as ProviderRotationState["quotaStates"]
-			: undefined,
 	};
 }
 

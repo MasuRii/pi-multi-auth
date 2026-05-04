@@ -1,8 +1,11 @@
 import type { Api, Model, SimpleStreamOptions } from "@mariozechner/pi-ai";
 import type { StoredAuthCredential, SupportedProviderId } from "./types.js";
+import { isRecord } from "./auth-error-utils.js";
+import { isCloudflareWorkersAiProvider } from "./cloudflare-provider.js";
 
 const CLOUDFLARE_OPENAI_BASE_URL_PATTERN =
 	/^\/client\/v4\/accounts\/[^/]+\/ai\/v1\/?$/;
+const LOOPBACK_IPV4_PREFIX = "127.";
 
 export class CredentialRequestConfigurationError extends Error {
 	constructor(message: string) {
@@ -24,9 +27,6 @@ interface RequestOverrideResult {
 	headers: SimpleStreamOptions["headers"];
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function getRequestOverrides(
 	provider: SupportedProviderId,
@@ -43,6 +43,17 @@ function getRequestOverrides(
 		);
 	}
 	return request;
+}
+
+function isLoopbackOrLocalHostname(hostname: string): boolean {
+	const normalizedHostname = hostname.toLowerCase();
+	return (
+		normalizedHostname === "localhost" ||
+		normalizedHostname.endsWith(".localhost") ||
+		normalizedHostname === "::1" ||
+		normalizedHostname === "[::1]" ||
+		normalizedHostname.startsWith(LOOPBACK_IPV4_PREFIX)
+	);
 }
 
 function validateBaseUrl(
@@ -69,6 +80,11 @@ function validateBaseUrl(
 	if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
 		throw new CredentialRequestConfigurationError(
 			`Credential '${credentialId}' for ${provider} request.baseUrl must use http or https.`,
+		);
+	}
+	if (parsed.protocol === "http:" && !isLoopbackOrLocalHostname(parsed.hostname)) {
+		throw new CredentialRequestConfigurationError(
+			`Credential '${credentialId}' for ${provider} request.baseUrl may use http only for loopback or localhost development endpoints. Use https for remote endpoints.`,
 		);
 	}
 
@@ -129,6 +145,7 @@ export function isValidCloudflareOpenAIBaseUrl(baseUrl: string): boolean {
 }
 
 function assertCloudflareBaseUrl(
+	provider: SupportedProviderId,
 	credentialId: string,
 	baseUrl: string,
 ): void {
@@ -137,7 +154,7 @@ function assertCloudflareBaseUrl(
 	}
 
 	throw new CredentialRequestConfigurationError(
-		`Cloudflare credential '${credentialId}' must define request.baseUrl as https://api.cloudflare.com/client/v4/accounts/<account_id>/ai/v1 so multi-auth can rotate account-scoped Cloudflare credentials correctly.`,
+		`Cloudflare credential '${credentialId}' for ${provider} must define request.baseUrl as https://api.cloudflare.com/client/v4/accounts/<account_id>/ai/v1 so multi-auth can rotate account-scoped Cloudflare credentials correctly. Paste the Cloudflare account ID, dashboard token URL, or full Workers AI base URL alongside the API token when adding the credential.`,
 	);
 }
 
@@ -165,8 +182,8 @@ export function applyCredentialRequestOverrides({
 		};
 	}
 
-	if (provider === "cloudflare") {
-		assertCloudflareBaseUrl(credentialId, effectiveModel.baseUrl);
+	if (isCloudflareWorkersAiProvider(provider)) {
+		assertCloudflareBaseUrl(provider, credentialId, effectiveModel.baseUrl);
 	}
 
 	return {

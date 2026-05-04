@@ -18,10 +18,13 @@ import {
 import { getErrorMessage, isAbortError } from "./auth-error-utils.js";
 import {
 	classifyCredentialError,
+	isCredentialModelIncompatibilityError,
 	isRetryableModelAvailabilityError,
 	type CredentialErrorKind,
 } from "./error-classifier.js";
 import { buildClineClientHeaders } from "./cline-compat.js";
+import { isCloudflareCredentialManagedAuthProvider } from "./cloudflare-provider.js";
+import { buildKiloRequestHeaders } from "./kilo-compat.js";
 import { describeCredentialErrorAction } from "./credential-error-formatting.js";
 import { applyCredentialRequestOverrides } from "./credential-request-overrides.js";
 import { multiAuthDebugLogger } from "./debug-logger.js";
@@ -37,7 +40,7 @@ import type {
 	SupportedProviderId,
 } from "./types.js";
 
-const MAX_ROTATION_RETRIES = 10;
+const MIN_ROTATION_ATTEMPT_LIMIT = 11;
 const MAX_TRANSIENT_RETRIES_PER_CREDENTIAL = 2;
 const PROVIDER_REGISTRATION_CHURN_WINDOW_MS = 100;
 
@@ -193,17 +196,64 @@ function isOllamaProvider(provider: SupportedProviderId): boolean {
 	return provider.trim().toLowerCase() === "ollama";
 }
 
+const CREDENTIAL_MANAGED_AUTH_HEADER_NAMES = new Set([
+	"authorization",
+	"x-api-key",
+	"api-key",
+]);
+
+function shouldStripCallerAuthHeaders(provider: SupportedProviderId): boolean {
+	return isCloudflareCredentialManagedAuthProvider(provider);
+}
+
+function stripCallerAuthHeaders(
+	provider: SupportedProviderId,
+	headers: SimpleStreamOptions["headers"],
+): SimpleStreamOptions["headers"] {
+	if (!headers || !shouldStripCallerAuthHeaders(provider)) {
+		return headers;
+	}
+
+	const sanitizedHeaders: Record<string, string> = {};
+	const strippedHeaderNames: string[] = [];
+	for (const [headerName, headerValue] of Object.entries(headers)) {
+		const normalizedHeaderName = headerName.trim().toLowerCase();
+		if (CREDENTIAL_MANAGED_AUTH_HEADER_NAMES.has(normalizedHeaderName)) {
+			strippedHeaderNames.push(headerName);
+			continue;
+		}
+		sanitizedHeaders[headerName] = headerValue;
+	}
+
+	if (strippedHeaderNames.length === 0) {
+		return headers;
+	}
+
+	multiAuthDebugLogger.log("caller_auth_headers_stripped", {
+		provider,
+		headers: strippedHeaderNames,
+	});
+	return sanitizedHeaders;
+}
+
 function resolveProviderRequestHeaders(
 	provider: SupportedProviderId,
 	headers: SimpleStreamOptions["headers"],
 ): SimpleStreamOptions["headers"] {
-	if (provider !== "cline") {
-		return headers;
+	const credentialSafeHeaders = stripCallerAuthHeaders(provider, headers);
+	if (provider === "cline") {
+		return {
+			...credentialSafeHeaders,
+			...buildClineClientHeaders({ includeRequestTracking: true }),
+		};
 	}
-	return {
-		...headers,
-		...buildClineClientHeaders({ includeRequestTracking: true }),
-	};
+	if (provider === "kilo") {
+		return {
+			...credentialSafeHeaders,
+			...buildKiloRequestHeaders(),
+		};
+	}
+	return credentialSafeHeaders;
 }
 
 function isMalformedThinkingText(text: string): boolean {
@@ -510,7 +560,7 @@ function parseRotationFailureDetails(errorMessage: string): RotationFailureDetai
 		details.credentialCount = Number.parseInt(credentialCountMatch[1], 10);
 	}
 
-	const lastCredentialErrorMatch = /Last credential error:\s*([^]*?)(?:;\s*provider response:|$)/i.exec(errorMessage);
+	const lastCredentialErrorMatch = /Last (?:credential )?error:\s*([^]*?)(?:;\s*provider response:|$)/i.exec(errorMessage);
 	if (lastCredentialErrorMatch?.[1]?.trim()) {
 		details.lastCredentialError = lastCredentialErrorMatch[1].trim();
 	}
@@ -570,6 +620,23 @@ function resolveCredentialProviderId(
 	return providerFromModel.length > 0 ? providerFromModel : fallbackProvider;
 }
 
+async function resolveRotationAttemptLimit(
+	accountManager: AccountManager,
+	providerId: SupportedProviderId,
+): Promise<number> {
+	try {
+		const credentialIds = await accountManager.listProviderCredentialIds(providerId);
+		return Math.max(MIN_ROTATION_ATTEMPT_LIMIT, credentialIds.length);
+	} catch (error: unknown) {
+		multiAuthDebugLogger.log("rotation_attempt_limit_fallback", {
+			provider: providerId,
+			minimumAttemptLimit: MIN_ROTATION_ATTEMPT_LIMIT,
+			error: getErrorMessage(error, STRUCTURED_ERROR_MESSAGE_OPTIONS),
+		});
+		return MIN_ROTATION_ATTEMPT_LIMIT;
+	}
+}
+
 /**
  * Builds an API wrapper that injects rotated credentials and retries on quota/rate-limit errors.
  * Credential namespace is resolved from model.provider at request time.
@@ -619,6 +686,13 @@ export function createRotatingStreamWrapper(
 				stream.push(assistantAbort);
 				stream.end(assistantAbort.error);
 			};
+			let rotationAttemptLimit = MIN_ROTATION_ATTEMPT_LIMIT;
+			const refreshRotationAttemptLimit = async (): Promise<void> => {
+				rotationAttemptLimit = await resolveRotationAttemptLimit(
+					accountManager,
+					activeProviderId,
+				);
+			};
 
 			const switchToFailoverProvider = async (): Promise<boolean> => {
 				if (!lastFailoverTrigger) {
@@ -660,10 +734,12 @@ export function createRotatingStreamWrapper(
 				excludedCredentialIds = new Set<string>();
 				lastCredentialErrorMessage = null;
 				lastFailoverTrigger = null;
+				await refreshRotationAttemptLimit();
 				return true;
 			};
 
-			for (let attempt = 0; attempt <= MAX_ROTATION_RETRIES; attempt += 1) {
+			await refreshRotationAttemptLimit();
+			for (let attempt = 0; attempt < rotationAttemptLimit; attempt += 1) {
 				const delegatedCredentialOverride = resolveDelegatedCredentialOverride(activeProviderId);
 				const useDelegatedCredentialOverride = delegatedCredentialOverride !== undefined;
 				let selected;
@@ -765,6 +841,7 @@ export function createRotatingStreamWrapper(
 								activeProviderId,
 								selected.credentialId,
 								message,
+								classification.kind,
 							);
 							multiAuthDebugLogger.log("credential_disabled", {
 								provider: activeProviderId,
@@ -797,7 +874,7 @@ export function createRotatingStreamWrapper(
 						(classification.kind === "provider_transient" ||
 							classification.kind === "request_timeout") &&
 						!hasForwardedSubstantiveEvent &&
-						attempt < MAX_ROTATION_RETRIES
+						attempt + 1 < rotationAttemptLimit
 					) {
 						lastCredentialErrorMessage = message;
 						if (useDelegatedCredentialOverride) {
@@ -820,7 +897,7 @@ export function createRotatingStreamWrapper(
 
 					if (
 						classification.shouldRotateCredential &&
-						attempt < MAX_ROTATION_RETRIES
+						attempt + 1 < rotationAttemptLimit
 					) {
 						lastCredentialErrorMessage = message;
 						if (useDelegatedCredentialOverride) {
@@ -837,6 +914,25 @@ export function createRotatingStreamWrapper(
 									recommendedCooldownMs: classification.recommendedCooldownMs,
 								},
 							);
+						} else if (
+							isCredentialModelIncompatibilityError(message, {
+								providerId: activeProviderId,
+								modelId: requestModel.id,
+							})
+						) {
+							const blockedUntil = await accountManager.markCredentialModelIncompatible(
+								activeProviderId,
+								selected.credentialId,
+								requestModel.id,
+								message,
+							);
+							multiAuthDebugLogger.log("credential_model_incompatibility_recorded", {
+								provider: activeProviderId,
+								credentialId: selected.credentialId,
+								modelId: requestModel.id,
+								blockedUntil,
+								reason: message.slice(0, 200),
+							});
 						} else if (
 							isRetryableModelAvailabilityError(message, {
 								providerId: activeProviderId,
@@ -886,14 +982,18 @@ export function createRotatingStreamWrapper(
 					});
 					let innerStream: AssistantMessageEventStream;
 					try {
+						const credentialType = useDelegatedCredentialOverride
+							? "delegated"
+							: selected.credential?.type ?? "unknown";
+						const secretKind = selected.secret.startsWith("workos:")
+							? "workos"
+							: credentialType;
 						multiAuthDebugLogger.log("stream_request_auth", {
 							provider: activeProviderId,
 							credentialId: selected.credentialId,
-							credentialType: useDelegatedCredentialOverride
-								? "delegated"
-								: selected.credential?.type ?? "unknown",
-							secretPrefix: selected.secret.slice(0, 12),
-							secretStartsWithWorkos: selected.secret.startsWith("workos:"),
+							credentialType,
+							secretKind,
+							hasSecret: selected.secret.length > 0,
 							model: requestModel.id,
 							baseUrl: requestModel.baseUrl,
 							api: requestModel.api,
@@ -1016,6 +1116,7 @@ export function createRotatingStreamWrapper(
 										activeProviderId,
 										selected.credentialId,
 										Date.now() - requestStartedAt,
+										requestModel.id,
 									);
 									stream.end();
 									return;
@@ -1090,7 +1191,7 @@ export function createRotatingStreamWrapper(
 				? ` Last error: ${lastCredentialErrorMessage}`
 				: "";
 			throw new Error(
-				`Rotation exhausted for ${activeProviderId}: ${triedCount} credential(s) tried across ${MAX_ROTATION_RETRIES + 1} attempts, all appear quota-limited or rate-limited.${lastDetail}`,
+				`Rotation exhausted for ${activeProviderId}: ${triedCount} credential(s) tried across ${rotationAttemptLimit} attempt budget, all produced rotation-triggering errors.${lastDetail}`,
 			);
 		})().catch((error: unknown) => {
 			const errorMessage = getErrorMessage(error, STRUCTURED_ERROR_MESSAGE_OPTIONS);

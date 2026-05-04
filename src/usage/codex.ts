@@ -1,5 +1,5 @@
 import { request as httpsRequest } from "node:https";
-import { getErrorMessage } from "../auth-error-utils.js";
+import { getErrorMessage, isRecord } from "../auth-error-utils.js";
 import { quotaClassifier } from "../quota-classifier.js";
 import { headersToRecord, rateLimitHeaderParser } from "../rate-limit-headers.js";
 import type {
@@ -36,9 +36,6 @@ const PLAN_TYPE_MAP: Record<string, string> = {
 
 const cachedCodexAccountIdsByToken = new Map<string, string | null>();
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function asNumber(value: unknown): number | null {
 	return typeof value === "number" && Number.isFinite(value) ? value : null;

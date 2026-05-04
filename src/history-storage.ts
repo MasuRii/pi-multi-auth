@@ -7,7 +7,7 @@ import {
 	resolveStateHistoryPersistencePaths,
 	type HistoryPersistenceConfig,
 } from "./config.js";
-import { getErrorMessage } from "./auth-error-utils.js";
+import { getErrorMessage, isRecord } from "./auth-error-utils.js";
 import {
 	isRetryableFileAccessError,
 	readTextSnapshotWithRetries,
@@ -36,9 +36,6 @@ export interface MultiAuthHistoryStoreOptions {
 	historyPersistence?: HistoryPersistenceConfig;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function createEmptyHealthHistorySnapshot(): HealthHistorySnapshot {
 	return {

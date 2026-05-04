@@ -190,7 +190,7 @@ test("usage coordinator keeps 50, 100, and 500 credential windows bounded", asyn
 	}
 });
 
-test("usage coordinator re-checks cooldown policy before dispatching queued requests", async () => {
+test("usage coordinator keeps usage rate-limit failures scoped to the credential", async () => {
 	const coordinator = new UsageCoordinator(
 		createConfig({
 			globalMaxConcurrentFreshRequests: 1,
@@ -214,19 +214,26 @@ test("usage coordinator re-checks cooldown policy before dispatching queued requ
 		{ provider: "cooldown-provider", credentialId: createCredentialRef(2), operation: "direct" },
 		async () => {
 			queuedRunCount += 1;
-			return "unexpected-dispatch";
+			return "queued-dispatch";
 		},
 	);
 
 	const firstRejection = assert.rejects(first, /429 rate limit/);
-	const queuedRejection = assert.rejects(queued, /provider usage cooldown is active/);
 	firstGate.resolve();
 	await firstRejection;
-	await queuedRejection;
-	assert.equal(queuedRunCount, 0);
+	assert.equal(await queued, "queued-dispatch");
+	assert.equal(queuedRunCount, 1);
+
+	await assert.rejects(
+		coordinator.executeFreshRequest(
+			{ provider: "cooldown-provider", credentialId: createCredentialRef(1), operation: "direct" },
+			async () => "unexpected-repeat-dispatch",
+		),
+		/credential usage cooldown is active/,
+	);
 });
 
-test("usage coordinator re-checks circuit policy before dispatching queued requests", async () => {
+test("usage coordinator does not open provider circuits after usage auth failures", async () => {
 	const coordinator = new UsageCoordinator(
 		createConfig({
 			globalMaxConcurrentFreshRequests: 1,
@@ -250,16 +257,15 @@ test("usage coordinator re-checks circuit policy before dispatching queued reque
 		{ provider: "circuit-provider", credentialId: createCredentialRef(2), operation: "direct" },
 		async () => {
 			queuedRunCount += 1;
-			return "unexpected-dispatch";
+			return "queued-dispatch";
 		},
 	);
 
 	const firstRejection = assert.rejects(first, /401 unauthorized/);
-	const queuedRejection = assert.rejects(queued, /provider circuit is open/);
 	firstGate.resolve();
 	await firstRejection;
-	await queuedRejection;
-	assert.equal(queuedRunCount, 0);
+	assert.equal(await queued, "queued-dispatch");
+	assert.equal(queuedRunCount, 1);
 });
 
 test("usage service preserves single-flight fresh usage requests under coordination", async () => {
