@@ -646,6 +646,7 @@ export function createRotatingStreamWrapper(
 	accountManager: AccountManager,
 	baseProvider: ApiProviderRef,
 	baseProvidersByApi: ReadonlyMap<Api, ApiProviderRef> = new Map(),
+	excludedProviders?: ReadonlySet<string>,
 ): (
 	model: Model<Api>,
 	context: Context,
@@ -686,6 +687,41 @@ export function createRotatingStreamWrapper(
 				stream.push(assistantAbort);
 				stream.end(assistantAbort.error);
 			};
+
+			// Providers explicitly excluded from multi-auth rotation should pass
+			// through to the base API provider without credential management.
+			if (excludedProviders?.has(activeProviderId)) {
+				multiAuthDebugLogger.log("provider_excluded_passthrough", {
+					provider: activeProviderId,
+					model: activeModel.id,
+					api: activeModel.api,
+				});
+				try {
+					const innerStream = activeBaseProvider.streamSimple(activeModel, context, {
+						...options,
+						signal: options?.signal,
+					});
+					for await (const rawEvent of innerStream) {
+						stream.push(rawEvent);
+					}
+					stream.end();
+				} catch (error: unknown) {
+					if (isCallerAbort(options?.signal, error)) {
+						emitAbortedTermination(options?.signal?.reason ?? error);
+						return;
+					}
+					const message = getErrorMessage(error, STRUCTURED_ERROR_MESSAGE_OPTIONS);
+					const assistantError: AssistantMessageEvent = {
+						type: "error",
+						reason: "error",
+						error: createErrorAssistantMessage(activeModel, message),
+					};
+					stream.push(assistantError);
+					stream.end();
+				}
+				return;
+			}
+
 			let rotationAttemptLimit = MIN_ROTATION_ATTEMPT_LIMIT;
 			const refreshRotationAttemptLimit = async (): Promise<void> => {
 				rotationAttemptLimit = await resolveRotationAttemptLimit(
@@ -1322,6 +1358,7 @@ export async function registerMultiAuthProviders(
 			accountManager,
 			baseProvider,
 			baseProvidersByApi,
+			excludeSet,
 		);
 		wrappersByApi.set(api, streamSimple);
 		multiAuthDebugLogger.log("stream_wrapper_created", {
